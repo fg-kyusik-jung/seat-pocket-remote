@@ -95,6 +95,9 @@ void setPump(uint8_t speed) {
   }
 }
 
+// 밸브(+)는 릴레이 NO 단자에 연결됨. 릴레이는 액티브하이(판매처 확인)라
+// 에너자이즈(IN=HIGH) 시 COM-NO가 붙어 밸브가 통전되고, 비활성(IN=LOW) 시 COM-NC로 붙어 밸브는 비통전.
+// state=1(열림/통전)일 때 HIGH, state=0(닫힘/비통전)일 때 LOW.
 void setValve(uint8_t idx, uint8_t state) {
   digitalWrite(VALVE_PINS[idx], state ? HIGH : LOW);
 }
@@ -181,7 +184,7 @@ void setup() {
   for (uint8_t i = 0; i < NUM_SECTORS; i++) {
     pinMode(VALVE_PINS[i], OUTPUT);
     pinMode(LED_PINS[i], OUTPUT);
-    digitalWrite(VALVE_PINS[i], LOW);
+    digitalWrite(VALVE_PINS[i], LOW);  // 비활성(안전 기본값) = 밸브 비통전
     digitalWrite(LED_PINS[i], LOW);
   }
 

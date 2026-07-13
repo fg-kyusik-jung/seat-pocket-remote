@@ -64,7 +64,8 @@ void updatePumpFromPot() {
 
 void setValve(uint8_t idx, uint8_t state) {
   if (idx >= NUM_SECTORS) return;
-  digitalWrite(VALVE_PINS[idx], state ? HIGH : LOW);
+  // state가 1(열림)이면 LOW를 쏴서 릴레이를 켜고, 0이면 HIGH를 쏴서 끕니다.
+  digitalWrite(VALVE_PINS[idx], state ? LOW : HIGH);
 }
 
 void updateBuzzer(uint16_t sensorRaw[]) {
@@ -139,7 +140,7 @@ void setup() {
 
   for (uint8_t i = 0; i < NUM_SECTORS; i++) {
     pinMode(VALVE_PINS[i], OUTPUT);
-    digitalWrite(VALVE_PINS[i], LOW);
+    digitalWrite(VALVE_PINS[i], HIGH);  // 비활성(안전 기본값) = 밸브 비통전
   }
 
   pinMode(PUMP_PIN_A, OUTPUT);
