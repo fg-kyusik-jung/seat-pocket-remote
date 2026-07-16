@@ -23,9 +23,9 @@ const uint16_t POT_DEADBAND = 10;  // 가변저항 하단 노이즈로 인한 �
 const uint8_t BUZZER_PIN = 4;
 const unsigned int BUZZER_FREQ_HZ = 440;
 
-// 40kPa 도달 시 경보. raw->kPa 변환식이 아직 실측되지 않아, 임시로 ADC 풀스케일(1023)을
-// 40kPa 지점으로 가정해둠. 실측 후 ALARM 명령으로 섹터별 실제 임계값을 조정할 것.
-uint16_t alarmRawThreshold[NUM_SECTORS] = {1023};
+// 목표압력 상한 실측 확정값: raw≈500 (40kPa까지 쓸 필요 없어 kPa 변환은 보류, 2026-07-13 확정).
+// 필요시 ALARM 명령으로 섹터별 임계값 조정 가능.
+uint16_t alarmRawThreshold[NUM_SECTORS] = {500};
 bool buzzerActive = false;
 
 const unsigned long TELEMETRY_INTERVAL_MS = 50;
@@ -140,7 +140,7 @@ void setup() {
 
   for (uint8_t i = 0; i < NUM_SECTORS; i++) {
     pinMode(VALVE_PINS[i], OUTPUT);
-    digitalWrite(VALVE_PINS[i], HIGH);  // 비활성(안전 기본값) = 밸브 비통전
+    digitalWrite(VALVE_PINS[i], HIGH);  // 부팅 기본값 = 열림(배기, 잔압 방지)
   }
 
   pinMode(PUMP_PIN_A, OUTPUT);

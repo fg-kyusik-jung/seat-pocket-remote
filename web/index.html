@@ -16,6 +16,15 @@
   button { background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
   button:hover { background: #3a3a3a; }
   button.on { background: #2d5c2d; border-color: #4caf50; }
+  .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .toggle input { display: none; }
+  .toggle-track { position: relative; width: 46px; height: 24px; background: #555; border-radius: 12px; transition: background 0.15s; flex-shrink: 0; }
+  .toggle-thumb { position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; background: #eee; border-radius: 50%; transition: left 0.15s; }
+  .toggle input:checked + .toggle-track { background: #4caf50; }
+  .toggle input:checked + .toggle-track .toggle-thumb { left: 24px; }
+  .toggle-label { font-size: 13px; min-width: 32px; font-weight: bold; }
+  .toggle-label.open { color: #4caf50; }
+  .toggle-label.closed { color: #aaa; }
   .panel { margin-top: 20px; padding: 12px; background: #1a1a1a; border: 1px solid #333; border-radius: 4px; }
   .panel h2 { font-size: 14px; margin: 0 0 10px; }
   .row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -81,7 +90,7 @@ function ensureSectors(n) {
   if (sectorCount !== null) return;
   sectorCount = n;
   history = Array.from({length: n}, () => []);
-  valveState = Array.from({length: n}, () => 0);
+  valveState = Array.from({length: n}, () => 0);  // 하드웨어 부팅 기본값(닫힘)과 동일하게 시작
 
   tbody.innerHTML = "";
   for (let i = 0; i < n; i++) {
@@ -90,19 +99,43 @@ function ensureSectors(n) {
       <td>${i}</td>
       <td id="raw-${i}">-</td>
       <td id="volt-${i}">-</td>
-      <td><button id="valve-${i}">닫힘</button></td>
+      <td>
+        <label class="toggle">
+          <input type="checkbox" id="valve-${i}">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label closed" id="valve-label-${i}">닫힘</span>
+        </label>
+      </td>
     `;
     tbody.appendChild(tr);
-    document.getElementById(`valve-${i}`).addEventListener("click", () => toggleValve(i));
+    document.getElementById(`valve-${i}`).addEventListener("change", () => toggleValve(i));
   }
 }
 
+const VALVE_DEBOUNCE_MS = 300;  // 릴레이 물리적 스위칭 시간을 고려한 연속클릭 방지
+
 function toggleValve(i) {
-  valveState[i] = valveState[i] ? 0 : 1;
-  const btn = document.getElementById(`valve-${i}`);
-  btn.textContent = valveState[i] ? "열림" : "닫힘";
-  btn.className = valveState[i] ? "on" : "";
-  send({cmd: "valve", idx: i, state: valveState[i]});
+  const checkbox = document.getElementById(`valve-${i}`);
+
+  if (checkbox.disabled) {
+    // 디바운스 중 들어온 클릭은 되돌리고 무시
+    checkbox.checked = !checkbox.checked;
+    return;
+  }
+
+  const newState = checkbox.checked ? 1 : 0;
+  // 실제 하드웨어가 반대로 반응하는 것이 확인되어, 표시(라벨)는 그대로 두고 전송값만 반전시킴
+  if (!send({cmd: "valve", idx: i, state: newState ? 0 : 1})) {
+    checkbox.checked = !checkbox.checked;  // 전송 실패(웹소켓 미연결) 시 원래 상태로 되돌림
+    return;
+  }
+  valveState[i] = newState;
+  const label = document.getElementById(`valve-label-${i}`);
+  label.textContent = newState ? "열림" : "닫힘";
+  label.className = `toggle-label ${newState ? "open" : "closed"}`;
+
+  checkbox.disabled = true;
+  setTimeout(() => { checkbox.disabled = false; }, VALVE_DEBOUNCE_MS);
 }
 
 function updateTelemetry(values) {
@@ -162,7 +195,11 @@ function updateMotor(speed) {
 }
 
 function send(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+  return false;
 }
 
 document.getElementById("pumpDirApply").addEventListener("click", () => {
