@@ -1,19 +1,22 @@
-// 파일럿 3: 능동형 경도 조절 모드 검증
-// 4포켓/2모터 통합 하드웨어 기준. 밸브(6채널)/LED(3)/스위치(3)는 PCF8574 2개로 확장,
+// 파일럿 3: 능동형/실시간/매뉴얼 통합 UI + 하드웨어 제어
+// 4포켓/2모터 통합 하드웨어. 밸브(6채널)/LED(3)/스위치(3)는 PCF8574 2개로 확장,
 // LCD는 PCF8574 인터페이스 내장형 I2C 1602. 전부 같은 I2C 버스(A4/A5)에 병렬 연결.
+// UI(모드선택/캘리브레이션 연출/자세보정/포켓조절/프리셋)는 io_switch_test.ino에서 하드웨어 없이 먼저 검증 완료.
+// 이 파일은 그 UI 뒤에 실제 밸브/펌프/센서 제어를 연결한 최종본 — 2way 밸브 도착 후 바로 검증 가능.
 //
-// ⚠ 아직 실측 안 된 가정들 (배선 후 반드시 검증):
+// ⚠ 아직 실측 안 된 가정 (2way 밸브 배선 후 반드시 검증):
 //   - VALVE_ACTIVE_HIGH: 밸브 릴레이 익스팬더 출력 극성 (에너자이즈 시 HIGH인지 LOW인지)
-//   - LED_ACTIVE_LOW: LED 익스팬더 출력 극성
-//   - PUMP_FIXED_DIR: 파일럿1/2 실측치를 그대로 가정 (모터1/2 둘 다 동일 극성 배선이라는 가정, 개별 확인 필요)
-//   - LCD_PCF8574 핀 배치(RS/RW/EN/BL/D4~D7 = P0~P7): 시중 1602 I2C 백팩의 통용 배치를 가정
+//   - PUMP_FIXED_DIR: 파일럿1 실측치를 그대로 가정 (모터1/2 둘 다 동일 극성 배선이라는 가정, 개별 확인 필요)
+//   - ADJUST_BURST_MS(매뉴얼 조절 1스텝당 펌프 구동시간), 프리셋 적용 시 목표수렴 속도 — 실제 배관 연결 후 튜닝 필요
+// ✅ 이미 실측/확정된 것: LED_ACTIVE_LOW=false, IO익스팬더 0x20, 밸브익스팬더 0x24, LCD 핀배치(RS/RW/EN/BL/D4~D7), 엔코더 배선
 
 #include <Wire.h>
+#include <EEPROM.h>
 
 // ---------- I2C 주소 ----------
 const uint8_t ADDR_LCD = 0x27;
-const uint8_t ADDR_IO = 0x20;    // LED 3 + 스위치 3
-const uint8_t ADDR_VALVE = 0x24; // 밸브 릴레이 6채널 (2026-07-21 실측 확정: 점퍼 조정 결과 0x21이 아니라 0x24로 잡힘)
+const uint8_t ADDR_IO = 0x24;    // LED 3 + 스위치 3 (2026-07-23: 실측상 두 모듈 주소가 반대였음, 스왑함)
+const uint8_t ADDR_VALVE = 0x20; // 밸브 릴레이 6채널 (2026-07-23: 스왑됨)
 
 // ---------- 아두이노 직결 핀 ----------
 const uint8_t ENC_CLK_PIN = 2;  // 인터럽트
@@ -43,13 +46,13 @@ const uint8_t BIT_2WAY_POCKET[4] = {BIT_2WAY_P0, BIT_2WAY_P1, BIT_2WAY_P2, BIT_2
 const uint8_t BIT_3WAY_GROUP[2] = {BIT_3WAY_G1, BIT_3WAY_G2};
 
 // ---------- IO 익스팬더(ADDR_IO) 비트 배치 ----------
-const uint8_t BIT_LED[3] = {0, 1, 2};   // 0=능동형, 1=실시간, 2=매뉴얼
-const uint8_t BIT_SW[3] = {3, 4, 5};    // 0=능동형, 1=실시간, 2=매뉴얼
+const uint8_t BIT_LED[3] = {0, 1, 2};   // 프리셋 1/2/3 인디케이터
+const uint8_t BIT_SW[3] = {3, 4, 5};    // 프리셋 1/2/3 불러오기 버튼
 
-// ---------- 극성 가정 (실측 후 뒤집을 수 있음) ----------
-const bool VALVE_ACTIVE_HIGH = true; // true면 1=에너자이즈(2way 열림/3way 펌프모드)
-const bool LED_ACTIVE_LOW = false;    // true면 0=LED켜짐 (2026-07-21 실측: active-high로 확정)
-const uint8_t PUMP_FIXED_DIR = 0;
+// ---------- 극성 가정 ----------
+const bool VALVE_ACTIVE_HIGH = true; // true면 1=에너자이즈(2way 열림/3way 펌프모드) — 실측 필요
+const bool LED_ACTIVE_LOW = false;   // 2026-07-21 실측 확정
+const uint8_t PUMP_FIXED_DIR = 0;    // 파일럿1 실측치 가정 — 개별 재확인 필요
 
 // ---------- 튜닝 파라미터 (시리얼로 조정 가능) ----------
 uint16_t pressureCeilingRaw = 500;
@@ -59,43 +62,53 @@ uint8_t pumpSpeed = 255;
 const unsigned long SWEEP_TICK_MS = 100;
 const unsigned long INFLATE_TIMEOUT_MS = 30000;
 const unsigned long SWEEP_TIMEOUT_MS = 60000;
+const unsigned long ADJUST_BURST_MS = 200; // 매뉴얼 모드 회전 1스텝당 펌프/배기 구동시간 — 튜닝 필요
+
 const unsigned long LONG_PRESS_MS = 1000;
 const unsigned long SW_DEBOUNCE_MS = 150;
-const unsigned long DEBUG_PRINT_INTERVAL_MS = 200;
+const unsigned long DEBUG_PRINT_INTERVAL_MS = 500;
 
-// ---------- 시스템/모드 상태 ----------
+// ---------- 시스템 전원 / 엔코더 스위치(클릭) ----------
 bool systemOn = false;
-enum Mode { MODE_NONE, MODE_ACTIVE, MODE_REALTIME, MODE_MANUAL };
-Mode currentMode = MODE_NONE;
-
-enum ActiveState { AS_INFLATE, AS_SWEEP, AS_RETURN, AS_LOCKED };
-ActiveState activeState = AS_INFLATE;
-
-// SWEEP에서 찾은 최적점
-bool bestFound = false;
-uint16_t bestAvg = 0xFFFF;
-uint16_t bestTarget[4] = {0, 0, 0, 0};
-
-// RETURN 단계 그룹별 서브상태
-enum ReturnPhase { RP_INFLATE, RP_DEFLATE, RP_DONE };
-ReturnPhase returnPhase[2] = {RP_DONE, RP_DONE};
-
-unsigned long stateEnteredMs = 0;
-
-// ---------- 엔코더 (전원 ON/OFF 전용) ----------
-volatile unsigned long lastEncoderInterruptMicros = 0;
-const unsigned long ENCODER_DEBOUNCE_US = 5000;
-bool swPrevState = HIGH;
-unsigned long swPressStartMs = 0;
+bool encSwPrevState = HIGH;
+unsigned long encSwPressStartMs = 0;
+unsigned long encSwLastChangeMs = 0;
 bool longPressFired = false;
 
+bool clickPending = false;
+unsigned long clickPendingMs = 0;
+const unsigned long DOUBLE_CLICK_WINDOW_MS = 400;
+
+int8_t currentModeIdx = 0; // 0=AUTO FIT, 1=REALTIME, 2=MANUAL
+
+// 프리셋 전역 단축키 상태 (핸들러/함수는 아래쪽에 정의, 변수만 먼저 선언)
+bool presetApplying = false;
+uint8_t presetApplyingIdx = 0;
+unsigned long presetDisplayUntilMs = 0;
+const unsigned long PRESET_DISPLAY_HOLD_MS = 1500;
+
+// ---------- 엔코더 회전 ----------
+volatile int8_t rotAccum = 0;
+volatile unsigned long lastEncIsrMicros = 0;
+const unsigned long ENC_ISR_DEBOUNCE_US = 5000;
+
+void encoderISR() {
+  unsigned long now = micros();
+  if (now - lastEncIsrMicros < ENC_ISR_DEBOUNCE_US) return;
+  lastEncIsrMicros = now;
+  if (digitalRead(ENC_DT_PIN)) rotAccum--;
+  else rotAccum++;
+}
+
 // ---------- IO/밸브 익스팬더 섀도 레지스터 ----------
-uint8_t ioShadow = 0xFF;    // 기본값: LED 전부 꺼짐(active-low 가정), 스위치 입력용 풀업
+uint8_t ioShadow = 0xFF;
 uint8_t valveShadow = 0x00; // 기본값: 전부 비에너자이즈(안전)
+
+unsigned long lastSwPollMs = 0;
+bool swWasPressed[3] = {false, false, false};
 
 String inputLine;
 unsigned long lastDebugPrintMs = 0;
-unsigned long lastSweepTickMs = 0;
 
 // ================= I2C 저수준 =================
 void pcfWrite(uint8_t addr, uint8_t value) {
@@ -110,10 +123,8 @@ uint8_t pcfRead(uint8_t addr) {
   return 0xFF;
 }
 
-// ================= LCD (1602, PCF8574 인터페이스, 4비트 모드) =================
-// 통용 배치: P0=RS, P1=RW, P2=EN, P3=Backlight, P4~P7=D4~D7
+// ================= LCD (1602, PCF8574 내장, 4비트 모드) =================
 const uint8_t LCD_BIT_RS = 0;
-const uint8_t LCD_BIT_RW = 1;
 const uint8_t LCD_BIT_EN = 2;
 const uint8_t LCD_BIT_BL = 3;
 
@@ -154,11 +165,11 @@ void lcdInit() {
   lcdWrite4(0x3, false);
   delayMicroseconds(150);
   lcdWrite4(0x3, false);
-  lcdWrite4(0x2, false); // 4비트 모드 진입
-  lcdCommand(0x28); // 4비트, 2행, 5x8 폰트
-  lcdCommand(0x0C); // 디스플레이 on, 커서 off
-  lcdCommand(0x06); // 커서 자동 우측 이동
-  lcdCommand(0x01); // 클리어
+  lcdWrite4(0x2, false);
+  lcdCommand(0x28);
+  lcdCommand(0x0C);
+  lcdCommand(0x06);
+  lcdCommand(0x01);
   delay(2);
 }
 
@@ -186,6 +197,22 @@ void lcdPrintLine(uint8_t row, const char *s) {
   lcdPrint(buf);
 }
 
+void lcdBacklightOff() {
+  pcfWrite(ADDR_LCD, 0x00);
+}
+
+void lcdBacklightOn() {
+  pcfWrite(ADDR_LCD, (1 << LCD_BIT_BL));
+}
+
+void lcdCreateChar(uint8_t location, const uint8_t *charmap) {
+  lcdCommand(0x40 | ((location & 0x7) << 3));
+  for (uint8_t i = 0; i < 8; i++) lcdChar(charmap[i]);
+}
+
+const uint8_t CHAR_BOOKMARK = 1;
+const uint8_t BOOKMARK_GLYPH[8] = {0x1F, 0x11, 0x11, 0x11, 0x11, 0x15, 0x1B, 0x00};
+
 // ================= IO 익스팬더 (LED + 스위치) =================
 void setLed(uint8_t idx, bool on) {
   bool bitHigh = LED_ACTIVE_LOW ? !on : on;
@@ -194,12 +221,11 @@ void setLed(uint8_t idx, bool on) {
   pcfWrite(ADDR_IO, ioShadow);
 }
 
-void setLedExclusive(uint8_t idx) {
+void setLedExclusive(int8_t idx) {
   for (uint8_t i = 0; i < 3; i++) setLed(i, i == idx);
 }
 
 bool readSwitch(uint8_t idx) {
-  // 스위치 비트는 항상 1(풀업)로 유지해야 하므로 쓰기 전 보장
   uint8_t writeVal = ioShadow;
   for (uint8_t i = 0; i < 3; i++) writeVal |= (1 << BIT_SW[i]);
   if (writeVal != ioShadow) {
@@ -259,6 +285,12 @@ void stopAllPumps() {
   stopPump(1);
 }
 
+void stopEverythingSafely() {
+  stopAllPumps();
+  closeAllValves();
+  noTone(BUZZER_PIN);
+}
+
 // ================= 센서 =================
 uint16_t sensorRaw[4];
 
@@ -276,7 +308,76 @@ uint8_t rawToLevel(uint16_t raw) {
   return (uint8_t)level;
 }
 
-// ================= 부저 =================
+uint16_t levelToRawTarget(uint8_t level) {
+  if (level < 1) level = 1;
+  if (level > 10) level = 10;
+  return 80 + (uint16_t)(level - 1) * 42 + 21; // 해당 레벨 구간의 대략적 중간값
+}
+
+// ================= 그룹별 목표압력 추적 (능동형 RETURN 단계 / 프리셋 적용 공용) =================
+enum ReturnPhase { RP_INFLATE, RP_DEFLATE, RP_DONE };
+ReturnPhase returnPhase[2] = {RP_DONE, RP_DONE};
+uint16_t targetRaw[4] = {0, 0, 0, 0};
+
+void startTargetSeek(const uint16_t targets[4]) {
+  for (uint8_t i = 0; i < 4; i++) targetRaw[i] = targets[i];
+  returnPhase[0] = RP_INFLATE;
+  returnPhase[1] = RP_INFLATE;
+}
+
+void tickTargetSeekGroup(uint8_t groupIdx) {
+  if (returnPhase[groupIdx] == RP_DONE) return;
+
+  readAllSensors();
+  uint8_t p0 = groupIdx == 0 ? 0 : 2;
+  uint8_t p1 = groupIdx == 0 ? 1 : 3;
+
+  if (returnPhase[groupIdx] == RP_INFLATE) {
+    bool need0 = sensorRaw[p0] + toleranceRaw < targetRaw[p0];
+    bool need1 = sensorRaw[p1] + toleranceRaw < targetRaw[p1];
+    if (!need0 && !need1) {
+      stopPump(groupIdx);
+      setValve2way(p0, false);
+      setValve2way(p1, false);
+      returnPhase[groupIdx] = RP_DEFLATE;
+      return;
+    }
+    setValve3way(groupIdx, true);
+    setValve2way(p0, need0);
+    setValve2way(p1, need1);
+    runPump(groupIdx, pumpSpeed);
+  } else if (returnPhase[groupIdx] == RP_DEFLATE) {
+    bool need0 = sensorRaw[p0] > targetRaw[p0] + toleranceRaw;
+    bool need1 = sensorRaw[p1] > targetRaw[p1] + toleranceRaw;
+    if (!need0 && !need1) {
+      setValve2way(p0, false);
+      setValve2way(p1, false);
+      setValve3way(groupIdx, false);
+      returnPhase[groupIdx] = RP_DONE;
+      return;
+    }
+    setValve3way(groupIdx, false);
+    setValve2way(p0, need0);
+    setValve2way(p1, need1);
+  }
+}
+
+bool tickTargetSeek() {
+  tickTargetSeekGroup(0);
+  tickTargetSeekGroup(1);
+  return returnPhase[0] == RP_DONE && returnPhase[1] == RP_DONE;
+}
+
+// ================= 능동형 모드 하드웨어 상태머신 (모드1 캘리브레이션의 실제 엔진) =================
+enum ActiveState { AS_INFLATE, AS_SWEEP, AS_RETURN, AS_LOCKED };
+ActiveState activeState = AS_INFLATE;
+unsigned long activeStateEnteredMs = 0;
+unsigned long lastSweepTickMs = 0;
+
+bool bestFound = false;
+uint16_t bestAvg = 0xFFFF;
+uint16_t bestTarget[4] = {0, 0, 0, 0};
+
 bool buzzerActive = false;
 void updateBuzzer(bool shouldBeep) {
   if (shouldBeep && !buzzerActive) {
@@ -288,10 +389,9 @@ void updateBuzzer(bool shouldBeep) {
   }
 }
 
-// ================= 능동형 모드 상태머신 =================
 void enterInflate() {
   activeState = AS_INFLATE;
-  stateEnteredMs = millis();
+  activeStateEnteredMs = millis();
   bestFound = false;
   bestAvg = 0xFFFF;
   setValve3way(0, true);
@@ -314,11 +414,15 @@ void tickInflate() {
   if (group1Running) runPump(0, pumpSpeed); else stopPump(0);
   if (group2Running) runPump(1, pumpSpeed); else stopPump(1);
 
-  if (allDone || (millis() - stateEnteredMs) > INFLATE_TIMEOUT_MS) {
+  updateBuzzer(sensorRaw[0] >= pressureCeilingRaw || sensorRaw[1] >= pressureCeilingRaw ||
+               sensorRaw[2] >= pressureCeilingRaw || sensorRaw[3] >= pressureCeilingRaw);
+
+  if (allDone || (millis() - activeStateEnteredMs) > INFLATE_TIMEOUT_MS) {
     stopAllPumps();
     for (uint8_t i = 0; i < 4; i++) setValve2way(i, false);
+    updateBuzzer(false);
     activeState = AS_SWEEP;
-    stateEnteredMs = millis();
+    activeStateEnteredMs = millis();
     setValve3way(0, false);
     setValve3way(1, false);
   }
@@ -352,7 +456,7 @@ void tickSweep() {
   }
 
   bool atFloor = refLow <= pressureFloorRaw;
-  bool timedOut = (millis() - stateEnteredMs) > SWEEP_TIMEOUT_MS;
+  bool timedOut = (millis() - activeStateEnteredMs) > SWEEP_TIMEOUT_MS;
   if (atFloor || timedOut) {
     for (uint8_t i = 0; i < 4; i++) setValve2way(i, false);
     if (!bestFound) {
@@ -360,57 +464,17 @@ void tickSweep() {
       for (uint8_t i = 0; i < 4; i++) bestTarget[i] = sensorRaw[i];
     }
     activeState = AS_RETURN;
-    stateEnteredMs = millis();
-    returnPhase[0] = RP_INFLATE;
-    returnPhase[1] = RP_INFLATE;
-  }
-}
-
-void tickReturnGroup(uint8_t groupIdx) {
-  if (returnPhase[groupIdx] == RP_DONE) return;
-
-  readAllSensors();
-  uint8_t p0 = groupIdx == 0 ? 0 : 2;
-  uint8_t p1 = groupIdx == 0 ? 1 : 3;
-
-  if (returnPhase[groupIdx] == RP_INFLATE) {
-    bool need0 = sensorRaw[p0] + toleranceRaw < bestTarget[p0];
-    bool need1 = sensorRaw[p1] + toleranceRaw < bestTarget[p1];
-    if (!need0 && !need1) {
-      stopPump(groupIdx);
-      setValve2way(p0, false);
-      setValve2way(p1, false);
-      returnPhase[groupIdx] = RP_DEFLATE;
-      return;
-    }
-    setValve3way(groupIdx, true);
-    setValve2way(p0, need0);
-    setValve2way(p1, need1);
-    runPump(groupIdx, pumpSpeed);
-  } else if (returnPhase[groupIdx] == RP_DEFLATE) {
-    bool need0 = sensorRaw[p0] > bestTarget[p0] + toleranceRaw;
-    bool need1 = sensorRaw[p1] > bestTarget[p1] + toleranceRaw;
-    if (!need0 && !need1) {
-      setValve2way(p0, false);
-      setValve2way(p1, false);
-      setValve3way(groupIdx, false);
-      returnPhase[groupIdx] = RP_DONE;
-      return;
-    }
-    setValve3way(groupIdx, false);
-    setValve2way(p0, need0);
-    setValve2way(p1, need1);
+    activeStateEnteredMs = millis();
+    startTargetSeek(bestTarget);
   }
 }
 
 void tickReturn() {
-  tickReturnGroup(0);
-  tickReturnGroup(1);
-  if (returnPhase[0] == RP_DONE && returnPhase[1] == RP_DONE) {
+  if (tickTargetSeek()) {
     stopAllPumps();
     closeAllValves();
     activeState = AS_LOCKED;
-    stateEnteredMs = millis();
+    activeStateEnteredMs = millis();
   }
 }
 
@@ -423,65 +487,613 @@ void runActiveMode() {
   }
 }
 
-// ================= 모드 전환 =================
-void stopEverythingSafely() {
-  stopAllPumps();
-  closeAllValves();
-  noTone(BUZZER_PIN);
-  buzzerActive = false;
+// ================= 모드1(AUTO FIT) 캘리브레이션 UI =================
+enum CalState { CAL_IDLE, CAL_ANALYZING, CAL_COMPLETE_SHOW, CAL_LOCKED };
+CalState calState = CAL_IDLE;
+unsigned long calStateStartMs = 0;
+unsigned long lastLetterMs = 0;
+uint8_t revealedChars = 0;
+
+const char LINE0_TEXT[] = "Analyzing your";
+const char LINE1_TEXT[] = "body pressure";
+const uint8_t LINE0_LEN = sizeof(LINE0_TEXT) - 1;
+const uint8_t LINE1_LEN = sizeof(LINE1_TEXT) - 1;
+const uint8_t ANALYZE_TOTAL_LEN = LINE0_LEN + LINE1_LEN;
+const unsigned long LETTER_REVEAL_MS = 150;
+
+const unsigned long DOT_ANIM_INTERVAL_MS = 400;
+unsigned long lastDotAnimMs = 0;
+uint8_t dotCount = 1;
+
+void drawAnalyzingPartial(uint8_t count) {
+  char line0[17];
+  char line1[17];
+  for (uint8_t i = 0; i < 16; i++) { line0[i] = ' '; line1[i] = ' '; }
+  line0[16] = '\0';
+  line1[16] = '\0';
+  for (uint8_t i = 0; i < count && i < ANALYZE_TOTAL_LEN; i++) {
+    if (i < LINE0_LEN) line0[i] = LINE0_TEXT[i];
+    else line1[i - LINE0_LEN] = LINE1_TEXT[i - LINE0_LEN];
+  }
+  lcdPrintLine(0, line0);
+  lcdPrintLine(1, line1);
 }
 
-void switchMode(Mode m) {
-  if (m == currentMode) return;
-  stopEverythingSafely();
-  currentMode = m;
-  setLedExclusive((uint8_t)m - 1);
-  if (m == MODE_ACTIVE) {
-    enterInflate();
+void drawDotAnimFrame() {
+  char line1[17];
+  uint8_t i = 0;
+  for (; i < LINE1_LEN; i++) line1[i] = LINE1_TEXT[i];
+  for (uint8_t d = 0; d < dotCount && i < 16; d++, i++) line1[i] = '.';
+  for (; i < 16; i++) line1[i] = ' ';
+  line1[16] = '\0';
+  lcdPrintLine(1, line1);
+}
+
+void playCompleteChime() {
+  const int notes[4] = {262, 330, 392, 523}; // 도-미-솔-도
+  for (uint8_t i = 0; i < 4; i++) {
+    tone(BUZZER_PIN, notes[i]);
+    delay(100);
+  }
+  noTone(BUZZER_PIN);
+}
+
+void showMaintainingPressure() {
+  lcdPrintLine(0, "Maintaining");
+  lcdPrintLine(1, "Optimal Pressure");
+}
+
+void startCalibration() {
+  calState = CAL_ANALYZING;
+  calStateStartMs = millis();
+  lastLetterMs = 0;
+  revealedChars = 0;
+  lastDotAnimMs = 0;
+  dotCount = 1;
+  lcdClear();
+  enterInflate(); // 실제 능동형 하드웨어 알고리즘 시작
+  Serial.println(F("캘리브레이션(능동형) 시작"));
+}
+
+void tickCalibration() {
+  if (calState == CAL_IDLE || calState == CAL_LOCKED) return;
+
+  unsigned long now = millis();
+
+  if (calState == CAL_ANALYZING) {
+    runActiveMode(); // 실제 밸브/펌프/센서 진행
+
+    if (revealedChars < ANALYZE_TOTAL_LEN) {
+      if (now - lastLetterMs >= LETTER_REVEAL_MS) {
+        lastLetterMs = now;
+        revealedChars++;
+        drawAnalyzingPartial(revealedChars);
+      }
+    } else if (now - lastDotAnimMs >= DOT_ANIM_INTERVAL_MS) {
+      lastDotAnimMs = now;
+      drawDotAnimFrame();
+      dotCount++;
+      if (dotCount > 3) dotCount = 1;
+    }
+
+    if (activeState == AS_LOCKED) {
+      calState = CAL_COMPLETE_SHOW;
+      calStateStartMs = now;
+      lcdPrintLine(0, "Analyze Complete");
+      lcdPrintLine(1, "!");
+      playCompleteChime();
+      Serial.println(F("캘리브레이션 완료"));
+    }
+  } else if (calState == CAL_COMPLETE_SHOW) {
+    if (now - calStateStartMs >= 2000) {
+      calState = CAL_LOCKED;
+      showMaintainingPressure();
+      Serial.println(F("잠금 모드 진입"));
+    }
   }
 }
 
-// ================= 엔코더 (전원 ON/OFF) =================
-void encoderSwISR_placeholder() {} // 회전(CLK/DT)은 이번 파일럿에서 미사용, 매뉴얼 모드용으로 예약
+// ================= 모드2(REALTIME) 자세 보정 =================
+enum Mode2State { M2_IDLE, M2_BALANCED, M2_ALERT };
+Mode2State mode2State = M2_IDLE;
+unsigned long alertStartMs = 0;
+unsigned long lastBlinkMs = 0;
+bool blinkOn = false;
+const unsigned long ALERT_DURATION_MS = 10000;
+const unsigned long BLINK_INTERVAL_MS = 250;
+const unsigned int ALERT_TONE_HZ = 440;
+uint8_t alertBeepCount = 0;
+const uint8_t ALERT_BEEP_MAX = 4;
+
+void showWellBalanced() {
+  lcdPrintLine(0, "Well balanced :)");
+  lcdPrintLine(1, "");
+}
+
+void showSitUpStraight() {
+  lcdPrintLine(0, "Sit up straight");
+  lcdPrintLine(1, "!!!");
+}
+
+void resetMode2() {
+  mode2State = M2_IDLE;
+  noTone(BUZZER_PIN);
+  lcdBacklightOn();
+}
+
+void enterMode2Balanced() {
+  mode2State = M2_BALANCED;
+  noTone(BUZZER_PIN);
+  lcdBacklightOn();
+  stopAllPumps();
+  closeAllValves(); // 진입 시점 경도(밸브 잠금) 상태 유지
+  showWellBalanced();
+  Serial.println(F("모드2 진입 - Well balanced"));
+}
+
+void enterMode2Alert() {
+  mode2State = M2_ALERT;
+  alertStartMs = millis();
+  lastBlinkMs = 0;
+  blinkOn = false;
+  alertBeepCount = 0;
+  showSitUpStraight();
+  // ---- 준비: 원하는 자세로 유도하는 실제 액추에이션(밸브/펌프 조정) 로직 필요 - 트리거/보정 알고리즘 실험 후 구현
+  Serial.println(F("자세 이상 감지 - Sit up straight"));
+}
+
+void tickMode2() {
+  if (mode2State == M2_IDLE) return;
+
+  unsigned long now = millis();
+
+  // ---- 준비: 실제 자세 이상 감지 트리거로 교체할 것 (지금은 임시로 엔코더 CW 회전 감지)
+  noInterrupts();
+  int8_t step = rotAccum;
+  rotAccum = 0;
+  interrupts();
+  if (mode2State == M2_BALANCED && step > 0) {
+    enterMode2Alert();
+    return;
+  }
+
+  if (mode2State == M2_ALERT) {
+    if (now - lastBlinkMs >= BLINK_INTERVAL_MS) {
+      lastBlinkMs = now;
+      blinkOn = !blinkOn;
+      if (blinkOn) {
+        lcdBacklightOn();
+        if (alertBeepCount < ALERT_BEEP_MAX) {
+          tone(BUZZER_PIN, ALERT_TONE_HZ);
+          alertBeepCount++;
+        }
+      } else {
+        lcdBacklightOff();
+        noTone(BUZZER_PIN);
+      }
+    }
+    if (now - alertStartMs >= ALERT_DURATION_MS) { // ---- 준비 필요: 실측 조건(자세 복귀 판정)으로 교체
+      noTone(BUZZER_PIN);
+      lcdBacklightOn();
+      playCompleteChime();
+      enterMode2Balanced();
+    }
+  }
+}
+
+// ================= 모드3(MANUAL) 포켓 선택/조절 + 프리셋 =================
+enum Mode3State { M3_IDLE, M3_SELECT, M3_ADJUST, M3_PRESET_SELECT, M3_PRESET_SAVED };
+Mode3State mode3State = M3_IDLE;
+uint8_t selectedPocket = 0; // 0~3 = 포켓 1~4, 4 = 북마크(프리셋 저장)
+uint8_t presetSelectIdx = 0; // 0~2 = 프리셋 1~3
+uint8_t presets[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}; // 프리셋별 저장된 포켓 레벨(1~10), EEPROM과 동기화
+const int EEPROM_PRESET_BASE = 0; // 프리셋 3개 * 4바이트 = 12바이트(주소 0~11) 사용
+
+void loadPresetsFromEeprom() {
+  for (uint8_t p = 0; p < 3; p++) {
+    for (uint8_t i = 0; i < 4; i++) {
+      uint8_t v = EEPROM.read(EEPROM_PRESET_BASE + p * 4 + i);
+      presets[p][i] = (v >= 1 && v <= 10) ? v : 0;
+    }
+  }
+}
+
+void savePresetToEeprom(uint8_t idx) {
+  for (uint8_t i = 0; i < 4; i++) {
+    EEPROM.update(EEPROM_PRESET_BASE + idx * 4 + i, presets[idx][i]);
+  }
+}
+
+unsigned long lastBlinkSelMs = 0;
+bool blinkSelOn = true;
+const unsigned long SELECT_BLINK_MS = 500;
+
+void showMode3Default() {
+  readAllSensors();
+  lcdPrintLine(0, "MODE 3 - MANUAL");
+  char line1[17];
+  snprintf(line1, sizeof(line1), "%d %d %d %d",
+           rawToLevel(sensorRaw[0]), rawToLevel(sensorRaw[1]),
+           rawToLevel(sensorRaw[2]), rawToLevel(sensorRaw[3]));
+  lcdPrintLine(1, line1);
+}
+
+void drawSelectScreen() {
+  lcdPrintLine(0, "select section");
+  char line1[17];
+  uint8_t pos = 0;
+  for (uint8_t i = 0; i < 4; i++) {
+    bool hide = (i == selectedPocket) && !blinkSelOn;
+    line1[pos++] = hide ? ' ' : ('1' + i);
+    line1[pos++] = ' ';
+    line1[pos++] = ' ';
+  }
+  bool hideBookmark = (selectedPocket == 4) && !blinkSelOn;
+  line1[pos++] = hideBookmark ? ' ' : (char)CHAR_BOOKMARK;
+  line1[pos] = '\0';
+  lcdPrintLine(1, line1);
+}
+
+void drawAdjustScreen() {
+  char line0[17];
+  snprintf(line0, sizeof(line0), "#%d POCKET Adj.", selectedPocket + 1);
+  lcdPrintLine(0, line0);
+  char line1[17];
+  snprintf(line1, sizeof(line1), "Level %d", rawToLevel(sensorRaw[selectedPocket]));
+  lcdPrintLine(1, line1);
+}
+
+void drawPresetSelectScreen() {
+  lcdPrintLine(0, "PRESET");
+  char line1[17];
+  uint8_t pos = 0;
+  for (uint8_t i = 0; i < 3; i++) {
+    bool hide = (i == presetSelectIdx) && !blinkSelOn;
+    line1[pos++] = hide ? ' ' : ('1' + i);
+    if (i < 2) line1[pos++] = ' ';
+  }
+  line1[pos] = '\0';
+  lcdPrintLine(1, line1);
+}
+
+void drawPresetSaved() {
+  char line0[17];
+  snprintf(line0, sizeof(line0), "PRESET #%d", presetSelectIdx + 1);
+  lcdPrintLine(0, line0);
+  lcdPrintLine(1, "Saved! :)");
+}
+
+void savePresetFromCurrent(uint8_t idx) {
+  readAllSensors();
+  for (uint8_t i = 0; i < 4; i++) presets[idx][i] = rawToLevel(sensorRaw[i]);
+  savePresetToEeprom(idx);
+}
+
+void resetMode3() {
+  mode3State = M3_IDLE;
+}
+
+void enterMode3Select() {
+  mode3State = M3_SELECT;
+  selectedPocket = 0;
+  blinkSelOn = true;
+  lastBlinkSelMs = millis();
+  drawSelectScreen();
+}
+
+void enterMode3Adjust() {
+  mode3State = M3_ADJUST;
+  readAllSensors();
+  drawAdjustScreen();
+}
+
+void enterPresetSelect() {
+  mode3State = M3_PRESET_SELECT;
+  presetSelectIdx = 0;
+  blinkSelOn = true;
+  lastBlinkSelMs = millis();
+  drawPresetSelectScreen();
+}
+
+void tickMode3() {
+  if (mode3State == M3_IDLE) return;
+
+  unsigned long now = millis();
+
+  noInterrupts();
+  int8_t step = rotAccum;
+  rotAccum = 0;
+  interrupts();
+
+  if (mode3State == M3_SELECT) {
+    if (step > 0 && selectedPocket < 4) {
+      selectedPocket++;
+      blinkSelOn = true;
+      lastBlinkSelMs = now;
+      drawSelectScreen();
+    } else if (step < 0 && selectedPocket > 0) {
+      selectedPocket--;
+      blinkSelOn = true;
+      lastBlinkSelMs = now;
+      drawSelectScreen();
+    }
+    if (now - lastBlinkSelMs >= SELECT_BLINK_MS) {
+      lastBlinkSelMs = now;
+      blinkSelOn = !blinkSelOn;
+      drawSelectScreen();
+    }
+  } else if (mode3State == M3_ADJUST) {
+    if (step != 0) {
+      uint8_t groupIdx = POCKET_GROUP[selectedPocket];
+      readAllSensors();
+      if (step > 0) {
+        if (sensorRaw[selectedPocket] < pressureCeilingRaw) {
+          setValve3way(groupIdx, true);
+          setValve2way(selectedPocket, true);
+          runPump(groupIdx, pumpSpeed);
+          delay(ADJUST_BURST_MS);
+          stopPump(groupIdx);
+          setValve2way(selectedPocket, false);
+          setValve3way(groupIdx, false);
+        }
+      } else {
+        if (sensorRaw[selectedPocket] > pressureFloorRaw) {
+          setValve3way(groupIdx, false);
+          setValve2way(selectedPocket, true);
+          delay(ADJUST_BURST_MS);
+          setValve2way(selectedPocket, false);
+        }
+      }
+      readAllSensors();
+      drawAdjustScreen();
+    }
+  } else if (mode3State == M3_PRESET_SELECT) {
+    if (step > 0 && presetSelectIdx < 2) {
+      presetSelectIdx++;
+      blinkSelOn = true;
+      lastBlinkSelMs = now;
+      drawPresetSelectScreen();
+    } else if (step < 0 && presetSelectIdx > 0) {
+      presetSelectIdx--;
+      blinkSelOn = true;
+      lastBlinkSelMs = now;
+      drawPresetSelectScreen();
+    }
+    if (now - lastBlinkSelMs >= SELECT_BLINK_MS) {
+      lastBlinkSelMs = now;
+      blinkSelOn = !blinkSelOn;
+      drawPresetSelectScreen();
+    }
+  }
+}
+
+// ================= 최상위: 모드 선택 (회전=미리보기 전환, 싱글클릭=확정) =================
+enum TopState { TOP_MODE_SELECT, TOP_IN_MODE };
+TopState topState = TOP_MODE_SELECT;
+uint8_t modeSelectIdx = 0;
+const char *MODE_NAMES[3] = {"AUTO FIT", "REALTIME", "MANUAL"};
+
+void showSystemOn() {
+  lcdPrintLine(0, "SYSTEM ON");
+  lcdPrintLine(1, "HELLO :)");
+}
+
+void showMode(uint8_t idx) {
+  char line0[17];
+  snprintf(line0, sizeof(line0), "MODE %d", idx + 1);
+  lcdPrintLine(0, line0);
+  lcdPrintLine(1, MODE_NAMES[idx]);
+}
+
+void showSystemOff() {
+  lcdPrintLine(0, "SYSTEM OFF");
+  lcdPrintLine(1, "GOOD BYE :)");
+  delay(1200);
+  lcdClear();
+  lcdBacklightOff();
+}
+
+void showModeSelectPreview() {
+  if (modeSelectIdx == 2) {
+    showMode3Default();
+  } else {
+    showMode(modeSelectIdx);
+  }
+}
+
+void enterModeSelect() {
+  topState = TOP_MODE_SELECT;
+  if (currentModeIdx >= 0 && currentModeIdx <= 2) modeSelectIdx = currentModeIdx;
+  calState = CAL_IDLE;
+  resetMode2();
+  resetMode3();
+  showModeSelectPreview();
+}
+
+void confirmModeSelect() {
+  currentModeIdx = modeSelectIdx;
+  topState = TOP_IN_MODE;
+}
+
+void tickModeSelect() {
+  noInterrupts();
+  int8_t step = rotAccum;
+  rotAccum = 0;
+  interrupts();
+
+  bool changed = false;
+  if (step > 0 && modeSelectIdx < 2) {
+    modeSelectIdx++;
+    changed = true;
+  } else if (step < 0 && modeSelectIdx > 0) {
+    modeSelectIdx--;
+    changed = true;
+  }
+
+  if (changed) showModeSelectPreview();
+}
+
+// ================= 싱글클릭/더블클릭 동작 분기 =================
+void handleSingleClick() {
+  if (topState == TOP_MODE_SELECT) {
+    confirmModeSelect();
+    return;
+  }
+  if (currentModeIdx == 0 && calState == CAL_IDLE) {
+    startCalibration();
+  } else if (currentModeIdx == 1 && mode2State == M2_IDLE) {
+    enterMode2Balanced();
+  } else if (currentModeIdx == 2) {
+    if (mode3State == M3_IDLE) {
+      enterMode3Select();
+    } else if (mode3State == M3_SELECT) {
+      if (selectedPocket == 4) {
+        enterPresetSelect();
+      } else {
+        enterMode3Adjust();
+      }
+    } else if (mode3State == M3_PRESET_SELECT) {
+      savePresetFromCurrent(presetSelectIdx);
+      mode3State = M3_PRESET_SAVED;
+      drawPresetSaved();
+    }
+  }
+}
+
+void handleDoubleClick() {
+  if (topState == TOP_MODE_SELECT) return;
+
+  if (currentModeIdx == 0) {
+    if (calState == CAL_IDLE) {
+      enterModeSelect();
+    } else {
+      calState = CAL_IDLE;
+      stopEverythingSafely();
+      buzzerActive = false;
+      showMode(0);
+    }
+  } else if (currentModeIdx == 1) {
+    if (mode2State == M2_IDLE) {
+      enterModeSelect();
+    } else {
+      resetMode2();
+      showMode(1);
+    }
+  } else if (currentModeIdx == 2) {
+    if (mode3State == M3_IDLE) {
+      enterModeSelect();
+    } else if (mode3State == M3_SELECT) {
+      resetMode3();
+      showMode3Default();
+    } else if (mode3State == M3_ADJUST || mode3State == M3_PRESET_SELECT || mode3State == M3_PRESET_SAVED) {
+      mode3State = M3_SELECT;
+      blinkSelOn = true;
+      lastBlinkSelMs = millis();
+      drawSelectScreen();
+    }
+  }
+}
+
+void tickClickResolution() {
+  if (clickPending && (millis() - clickPendingMs) > DOUBLE_CLICK_WINDOW_MS) {
+    clickPending = false;
+    handleSingleClick();
+  }
+}
 
 void handlePowerSwitch() {
   bool swNow = digitalRead(ENC_SW_PIN);
   unsigned long now = millis();
 
-  // 누르고 있는 중 1초 경과 시점에 즉시 반응 (떼는 걸 기다리지 않음)
-  if (swNow == LOW && swPrevState == LOW && !longPressFired &&
-      (now - swPressStartMs) >= LONG_PRESS_MS) {
+  if (swNow == LOW && encSwPrevState == LOW && !longPressFired &&
+      (now - encSwPressStartMs) >= LONG_PRESS_MS) {
     longPressFired = true;
     systemOn = !systemOn;
-    if (!systemOn) {
-      stopEverythingSafely();
-      currentMode = MODE_NONE;
-      setLedExclusive(0xFF);
-      lcdClear();
-      lcdPrintLine(0, "SYSTEM OFF");
+    Serial.print(F("시스템 "));
+    Serial.println(systemOn ? F("ON") : F("OFF"));
+    if (systemOn) {
+      showSystemOn();
+      delay(1200);
+      enterModeSelect();
     } else {
-      switchMode(MODE_ACTIVE); // 최초 진입 시 바로 능동형(1번) 모드로
+      setLedExclusive(-1);
+      stopEverythingSafely();
+      buzzerActive = false;
+      calState = CAL_IDLE;
+      resetMode2();
+      resetMode3();
+      clickPending = false;
+      presetApplying = false;
+      showSystemOff();
     }
   }
 
-  if (swNow == LOW && swPrevState == HIGH) {
-    swPressStartMs = now;
+  if (swNow == LOW && encSwPrevState == HIGH) {
+    encSwPressStartMs = now;
     longPressFired = false;
+  } else if (swNow == HIGH && encSwPrevState == LOW) {
+    if (!longPressFired && systemOn) {
+      if (clickPending && (now - clickPendingMs) <= DOUBLE_CLICK_WINDOW_MS) {
+        clickPending = false;
+        handleDoubleClick();
+      } else {
+        clickPending = true;
+        clickPendingMs = now;
+      }
+    }
   }
-  swPrevState = swNow;
+  encSwPrevState = swNow;
 }
 
-// ================= 모드 선택 스위치 =================
-unsigned long lastSwPollMs = 0;
-bool swWasPressed[3] = {false, false, false};
+// ================= 프리셋 전역 단축키 (택트스위치, 모든 화면에서 진입 가능) =================
 
-void handleModeSwitches() {
+void activatePreset(uint8_t idx) {
+  bool anySaved = false;
+  for (uint8_t i = 0; i < 4; i++) if (presets[idx][i] != 0) anySaved = true;
+
+  setLedExclusive(idx);
+  lcdBacklightOn();
+  char line0[17];
+  snprintf(line0, sizeof(line0), "PRESET #%d", idx + 1);
+  lcdPrintLine(0, line0);
+
+  if (!anySaved) {
+    lcdPrintLine(1, "Empty");
+    presetDisplayUntilMs = millis() + PRESET_DISPLAY_HOLD_MS;
+    Serial.print(F("프리셋 "));
+    Serial.print(idx + 1);
+    Serial.println(F(" 저장된 값 없음"));
+    return;
+  }
+
+  lcdPrintLine(1, "Applying...");
+  presetApplying = true;
+  presetApplyingIdx = idx;
+  uint16_t targets[4];
+  for (uint8_t i = 0; i < 4; i++) targets[i] = levelToRawTarget(presets[idx][i]);
+  startTargetSeek(targets);
+
+  Serial.print(F("프리셋 "));
+  Serial.print(idx + 1);
+  Serial.print(F(" 적용 시작: "));
+  for (uint8_t i = 0; i < 4; i++) {
+    Serial.print(presets[idx][i]);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
+void handlePresetSwitches() {
   if (millis() - lastSwPollMs < SW_DEBOUNCE_MS) return;
   lastSwPollMs = millis();
   for (uint8_t i = 0; i < 3; i++) {
     bool pressed = readSwitch(i);
     if (pressed && !swWasPressed[i]) {
-      switchMode((Mode)(i + 1));
+      if (calState == CAL_ANALYZING || presetApplying) {
+        Serial.println(F("지금은 다른 하드웨어 동작 중이라 프리셋 적용 불가"));
+      } else {
+        activatePreset(i);
+      }
     }
     swWasPressed[i] = pressed;
   }
@@ -507,52 +1119,9 @@ void handleCommand(const String &line) {
     Serial.print(F(",FLOOR,"));
     Serial.print(pressureFloorRaw);
     Serial.print(F(",TOL,"));
-    Serial.println(toleranceRaw);
-  }
-}
-
-// ================= LCD 상태 표시 =================
-const char *activeStateName(ActiveState s) {
-  switch (s) {
-    case AS_INFLATE: return "ACTIVE:INFLATE";
-    case AS_SWEEP: return "ACTIVE:SWEEP";
-    case AS_RETURN: return "ACTIVE:RETURN";
-    case AS_LOCKED: return "ACTIVE:LOCKED";
-  }
-  return "ACTIVE:?";
-}
-
-void updateLcd() {
-  static char prevLine0[17] = "";
-  static char prevLine1[17] = "";
-  char line0[17];
-  char line1[17];
-
-  if (!systemOn) return;
-
-  if (currentMode == MODE_NONE) {
-    snprintf(line0, sizeof(line0), "MODE SELECT");
-    snprintf(line1, sizeof(line1), "SW1/2/3=A/R/M");
-  } else if (currentMode == MODE_ACTIVE) {
-    snprintf(line0, sizeof(line0), "%s", activeStateName(activeState));
-    snprintf(line1, sizeof(line1), "%d %d %d %d",
-             rawToLevel(sensorRaw[0]), rawToLevel(sensorRaw[1]),
-             rawToLevel(sensorRaw[2]), rawToLevel(sensorRaw[3]));
-  } else if (currentMode == MODE_REALTIME) {
-    snprintf(line0, sizeof(line0), "REALTIME");
-    snprintf(line1, sizeof(line1), "(not impl.)");
-  } else {
-    snprintf(line0, sizeof(line0), "MANUAL");
-    snprintf(line1, sizeof(line1), "(not impl.)");
-  }
-
-  if (strcmp(line0, prevLine0) != 0) {
-    lcdPrintLine(0, line0);
-    strncpy(prevLine0, line0, 17);
-  }
-  if (strcmp(line1, prevLine1) != 0) {
-    lcdPrintLine(1, line1);
-    strncpy(prevLine1, line1, 17);
+    Serial.print(toleranceRaw);
+    Serial.print(F(",SPEED,"));
+    Serial.println(pumpSpeed);
   }
 }
 
@@ -560,27 +1129,36 @@ void updateLcd() {
 void printDebug() {
   if (millis() - lastDebugPrintMs < DEBUG_PRINT_INTERVAL_MS) return;
   lastDebugPrintMs = millis();
-  Serial.print(F("MODE,"));
-  Serial.print((int)currentMode);
-  Serial.print(F(",ASTATE,"));
+  Serial.print(F("TOP,"));
+  Serial.print((int)topState);
+  Serial.print(F(",MODE,"));
+  Serial.print(currentModeIdx);
+  Serial.print(F(",CAL,"));
+  Serial.print((int)calState);
+  Serial.print(F(",AS,"));
   Serial.print((int)activeState);
+  Serial.print(F(",M2,"));
+  Serial.print((int)mode2State);
+  Serial.print(F(",M3,"));
+  Serial.print((int)mode3State);
   Serial.print(F(",RAW,"));
   for (uint8_t i = 0; i < 4; i++) {
     Serial.print(sensorRaw[i]);
     Serial.print(i < 3 ? "," : "");
   }
-  Serial.print(F(",BESTAVG,"));
-  Serial.println(bestFound ? bestAvg : 0);
+  Serial.println();
 }
 
 // ================= setup/loop =================
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  loadPresetsFromEeprom();
 
   pinMode(ENC_CLK_PIN, INPUT_PULLUP);
   pinMode(ENC_DT_PIN, INPUT_PULLUP);
   pinMode(ENC_SW_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, FALLING);
 
   pinMode(MOTOR1_IN1_PIN, OUTPUT);
   pinMode(MOTOR1_IN2_PIN, OUTPUT);
@@ -591,14 +1169,16 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   noTone(BUZZER_PIN);
 
-  pcfWrite(ADDR_VALVE, valveShadow); // 전 채널 비에너자이즈
-  pcfWrite(ADDR_IO, ioShadow);       // LED 꺼짐 + 스위치 풀업
+  pcfWrite(ADDR_VALVE, valveShadow);
+  pcfWrite(ADDR_IO, ioShadow);
 
   lcdInit();
-  lcdPrintLine(0, "SYSTEM OFF");
-  lcdPrintLine(1, "LONG PRESS = ON");
+  lcdCreateChar(CHAR_BOOKMARK, BOOKMARK_GLYPH);
+  lcdClear();
+  lcdBacklightOff(); // 전원 OFF 상태 = LCD 꺼짐
 
   inputLine.reserve(64);
+  Serial.println(F("파일럿3 시작 - 엔코더 롱프레스로 전원 ON/OFF"));
 }
 
 void loop() {
@@ -614,19 +1194,34 @@ void loop() {
   }
 
   handlePowerSwitch();
+  tickClickResolution();
 
   if (systemOn) {
-    handleModeSwitches();
-    if (currentMode == MODE_ACTIVE) {
-      runActiveMode();
-      bool alarm = (activeState == AS_INFLATE) &&
-                    (sensorRaw[0] >= pressureCeilingRaw || sensorRaw[1] >= pressureCeilingRaw ||
-                     sensorRaw[2] >= pressureCeilingRaw || sensorRaw[3] >= pressureCeilingRaw);
-      updateBuzzer(alarm);
+    handlePresetSwitches();
+
+    if (presetApplying) {
+      if (tickTargetSeek()) {
+        presetApplying = false;
+        stopAllPumps();
+        closeAllValves();
+        char line1[17];
+        snprintf(line1, sizeof(line1), "%d %d %d %d",
+                 presets[presetApplyingIdx][0], presets[presetApplyingIdx][1],
+                 presets[presetApplyingIdx][2], presets[presetApplyingIdx][3]);
+        lcdPrintLine(1, line1);
+        presetDisplayUntilMs = millis() + PRESET_DISPLAY_HOLD_MS;
+        Serial.println(F("프리셋 적용 완료"));
+      }
+    } else if (millis() < presetDisplayUntilMs) {
+      // 프리셋 화면 유지 중 - 다른 화면 갱신 보류
+    } else if (topState == TOP_MODE_SELECT) {
+      tickModeSelect();
     } else {
-      readAllSensors();
+      tickCalibration();
+      tickMode2();
+      tickMode3();
     }
-    updateLcd();
+
     printDebug();
   }
 }

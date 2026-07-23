@@ -14,7 +14,7 @@ const uint8_t BUZZER_PIN = 7;
 
 const uint8_t BIT_LED[3] = {0, 1, 2};
 const uint8_t BIT_SW[3] = {3, 4, 5};
-const bool LED_ACTIVE_LOW = false; // 2026-07-21 실측: active-high로 확정 (반대로 가정했었음)
+const bool LED_ACTIVE_LOW = false; // 2026-07-21 실측 확정치로 원복 (active-low 재배선 안 하기로 함)
 
 const unsigned long LONG_PRESS_MS = 1000;
 const unsigned long SW_DEBOUNCE_MS = 150;
