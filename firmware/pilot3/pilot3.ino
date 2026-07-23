@@ -7,7 +7,7 @@
 // ⚠ 아직 실측 안 된 가정 (2way 밸브 배선 후 반드시 검증):
 //   - VALVE_ACTIVE_HIGH: 밸브 릴레이 익스팬더 출력 극성 (에너자이즈 시 HIGH인지 LOW인지)
 //   - PUMP_FIXED_DIR: 파일럿1 실측치를 그대로 가정 (모터1/2 둘 다 동일 극성 배선이라는 가정, 개별 확인 필요)
-//   - ADJUST_BURST_MS(매뉴얼 조절 1스텝당 펌프 구동시간), 프리셋 적용 시 목표수렴 속도 — 실제 배관 연결 후 튜닝 필요
+//   - ADJUST_HOLD_TIMEOUT_MS(매뉴얼 조절 홀드 판정 시간), 프리셋 적용 시 목표수렴 속도 — 실제 배관 연결 후 튜닝 필요
 // ✅ 이미 실측/확정된 것: LED_ACTIVE_LOW=false, IO익스팬더 0x20, 밸브익스팬더 0x24, LCD 핀배치(RS/RW/EN/BL/D4~D7), 엔코더 배선
 
 #include <Wire.h>
@@ -62,7 +62,6 @@ uint8_t pumpSpeed = 255;
 const unsigned long SWEEP_TICK_MS = 100;
 const unsigned long INFLATE_TIMEOUT_MS = 30000;
 const unsigned long SWEEP_TIMEOUT_MS = 60000;
-const unsigned long ADJUST_BURST_MS = 200; // 매뉴얼 모드 회전 1스텝당 펌프/배기 구동시간 — 튜닝 필요
 
 const unsigned long LONG_PRESS_MS = 1000;
 const unsigned long SW_DEBOUNCE_MS = 150;
@@ -708,6 +707,13 @@ unsigned long lastBlinkSelMs = 0;
 bool blinkSelOn = true;
 const unsigned long SELECT_BLINK_MS = 500;
 
+// 매뉴얼 조절: "계속 돌리는 동안만" 홀드 방식 (파일럿2와 동일 패턴)
+const unsigned long ADJUST_HOLD_TIMEOUT_MS = 200;
+unsigned long lastAdjustCwMs = 0;
+unsigned long lastAdjustCcwMs = 0;
+unsigned long lastAdjustDrawMs = 0;
+const unsigned long ADJUST_DRAW_INTERVAL_MS = 150;
+
 void showMode3Default() {
   readAllSensors();
   lcdPrintLine(0, "MODE 3 - MANUAL");
@@ -783,6 +789,8 @@ void enterMode3Select() {
 
 void enterMode3Adjust() {
   mode3State = M3_ADJUST;
+  lastAdjustCwMs = millis() - ADJUST_HOLD_TIMEOUT_MS - 1;
+  lastAdjustCcwMs = millis() - ADJUST_HOLD_TIMEOUT_MS - 1;
   readAllSensors();
   drawAdjustScreen();
 }
@@ -823,28 +831,34 @@ void tickMode3() {
       drawSelectScreen();
     }
   } else if (mode3State == M3_ADJUST) {
-    if (step != 0) {
-      uint8_t groupIdx = POCKET_GROUP[selectedPocket];
-      readAllSensors();
-      if (step > 0) {
-        if (sensorRaw[selectedPocket] < pressureCeilingRaw) {
-          setValve3way(groupIdx, true);
-          setValve2way(selectedPocket, true);
-          runPump(groupIdx, pumpSpeed);
-          delay(ADJUST_BURST_MS);
-          stopPump(groupIdx);
-          setValve2way(selectedPocket, false);
-          setValve3way(groupIdx, false);
-        }
-      } else {
-        if (sensorRaw[selectedPocket] > pressureFloorRaw) {
-          setValve3way(groupIdx, false);
-          setValve2way(selectedPocket, true);
-          delay(ADJUST_BURST_MS);
-          setValve2way(selectedPocket, false);
-        }
-      }
-      readAllSensors();
+    // "계속 돌리는 동안만" 작동하는 홀드 방식 (파일럿2와 동일 UX)
+    if (step > 0) lastAdjustCwMs = now;
+    else if (step < 0) lastAdjustCcwMs = now;
+
+    bool holdingCw = (now - lastAdjustCwMs) < ADJUST_HOLD_TIMEOUT_MS;
+    bool holdingCcw = (now - lastAdjustCcwMs) < ADJUST_HOLD_TIMEOUT_MS;
+
+    uint8_t groupIdx = POCKET_GROUP[selectedPocket];
+    readAllSensors();
+
+    bool shouldInflate = holdingCw && sensorRaw[selectedPocket] < pressureCeilingRaw;
+    bool shouldDeflate = !shouldInflate && holdingCcw && sensorRaw[selectedPocket] > pressureFloorRaw;
+
+    if (shouldInflate) {
+      setValve3way(groupIdx, true);
+      setValve2way(selectedPocket, true);
+      runPump(groupIdx, pumpSpeed);
+    } else if (shouldDeflate) {
+      setValve3way(groupIdx, false);
+      setValve2way(selectedPocket, true);
+      stopPump(groupIdx);
+    } else {
+      setValve2way(selectedPocket, false);
+      stopPump(groupIdx);
+    }
+
+    if (now - lastAdjustDrawMs >= ADJUST_DRAW_INTERVAL_MS) {
+      lastAdjustDrawMs = now;
       drawAdjustScreen();
     }
   } else if (mode3State == M3_PRESET_SELECT) {
