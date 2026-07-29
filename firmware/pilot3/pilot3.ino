@@ -8,7 +8,7 @@
 //   - VALVE_ACTIVE_HIGH: 밸브 릴레이 익스팬더 출력 극성 (에너자이즈 시 HIGH인지 LOW인지)
 //   - PUMP_FIXED_DIR: 파일럿1 실측치를 그대로 가정 (모터1/2 둘 다 동일 극성 배선이라는 가정, 개별 확인 필요)
 //   - ADJUST_HOLD_TIMEOUT_MS(매뉴얼 조절 홀드 판정 시간), 프리셋 적용 시 목표수렴 속도 — 실제 배관 연결 후 튜닝 필요
-// ✅ 이미 실측/확정된 것: LED_ACTIVE_LOW=false, IO익스팬더 0x20, 밸브익스팬더 0x24, LCD 핀배치(RS/RW/EN/BL/D4~D7), 엔코더 배선
+// ✅ 이미 실측/확정된 것: LED_ACTIVE_LOW=false, IO익스팬더 0x24, 밸브익스팬더 0x20, LCD 핀배치(RS/RW/EN/BL/D4~D7), 엔코더 배선
 
 #include <Wire.h>
 #include <EEPROM.h>
@@ -108,6 +108,7 @@ bool swWasPressed[3] = {false, false, false};
 
 String inputLine;
 unsigned long lastDebugPrintMs = 0;
+bool debugPrintEnabled = true; // 시리얼 DEBUGPRINT,0 으로 끄면 명령 입력하기 편함 (DEBUGPRINT,1로 재개)
 
 // ================= I2C 저수준 =================
 void pcfWrite(uint8_t addr, uint8_t value) {
@@ -308,7 +309,7 @@ uint8_t rawToLevel(uint16_t raw) {
 }
 
 uint16_t levelToRawTarget(uint8_t level) {
-  if (level < 1) level = 1;
+  if (level == 0) return 80; // 프리셋 전용 특수값: 완전 배기(대기압 근처)
   if (level > 10) level = 10;
   return 80 + (uint16_t)(level - 1) * 42 + 21; // 해당 레벨 구간의 대략적 중간값
 }
@@ -368,10 +369,13 @@ bool tickTargetSeek() {
 }
 
 // ================= 능동형 모드 하드웨어 상태머신 (모드1 캘리브레이션의 실제 엔진) =================
-enum ActiveState { AS_INFLATE, AS_SWEEP, AS_RETURN, AS_LOCKED };
-ActiveState activeState = AS_INFLATE;
+enum ActiveState { AS_RESET, AS_INFLATE, AS_SWEEP, AS_RETURN, AS_LOCKED };
+ActiveState activeState = AS_LOCKED;
 unsigned long activeStateEnteredMs = 0;
 unsigned long lastSweepTickMs = 0;
+
+uint16_t resetTargetRaw = 90; // 캘리브레이션 시작 전 초기화(완전배기) 목표치, 시리얼 RESETRAW,<raw> 로 조정
+const unsigned long RESET_TIMEOUT_MS = 10000;
 
 bool bestFound = false;
 uint16_t bestAvg = 0xFFFF;
@@ -385,6 +389,33 @@ void updateBuzzer(bool shouldBeep) {
   } else if (!shouldBeep && buzzerActive) {
     noTone(BUZZER_PIN);
     buzzerActive = false;
+  }
+}
+
+// 캘리브레이션 시작 전 초기화 단계: 현재 압력 상태와 무관하게 일단 4포켓 전부 배기해서
+// 항상 같은 기준(빈 상태)에서 INFLATE를 시작하도록 함
+void enterReset() {
+  activeState = AS_RESET;
+  activeStateEnteredMs = millis();
+  stopAllPumps();
+  setValve3way(0, false);
+  setValve3way(1, false);
+  for (uint8_t i = 0; i < 4; i++) setValve2way(i, true);
+}
+
+void tickReset() {
+  readAllSensors();
+  bool allVented = true;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (sensorRaw[i] > resetTargetRaw) allVented = false;
+  }
+  bool timedOut = (millis() - activeStateEnteredMs) > RESET_TIMEOUT_MS;
+  if (allVented || timedOut) {
+    Serial.print(F("RESET 종료: "));
+    Serial.print(millis() - activeStateEnteredMs);
+    Serial.println(timedOut ? F("ms (timeout)") : F("ms (배기 완료)"));
+    for (uint8_t i = 0; i < 4; i++) setValve2way(i, false);
+    enterInflate();
   }
 }
 
@@ -417,6 +448,9 @@ void tickInflate() {
                sensorRaw[2] >= pressureCeilingRaw || sensorRaw[3] >= pressureCeilingRaw);
 
   if (allDone || (millis() - activeStateEnteredMs) > INFLATE_TIMEOUT_MS) {
+    Serial.print(F("INFLATE 종료: "));
+    Serial.print(millis() - activeStateEnteredMs);
+    Serial.println(allDone ? F("ms (ceiling 도달)") : F("ms (timeout)"));
     stopAllPumps();
     for (uint8_t i = 0; i < 4; i++) setValve2way(i, false);
     updateBuzzer(false);
@@ -457,6 +491,9 @@ void tickSweep() {
   bool atFloor = refLow <= pressureFloorRaw;
   bool timedOut = (millis() - activeStateEnteredMs) > SWEEP_TIMEOUT_MS;
   if (atFloor || timedOut) {
+    Serial.print(F("SWEEP 종료: "));
+    Serial.print(millis() - activeStateEnteredMs);
+    Serial.println(atFloor ? F("ms (floor 도달)") : F("ms (timeout)"));
     for (uint8_t i = 0; i < 4; i++) setValve2way(i, false);
     if (!bestFound) {
       bestFound = true;
@@ -470,6 +507,9 @@ void tickSweep() {
 
 void tickReturn() {
   if (tickTargetSeek()) {
+    Serial.print(F("RETURN 종료: "));
+    Serial.print(millis() - activeStateEnteredMs);
+    Serial.println(F("ms (목표 수렴)"));
     stopAllPumps();
     closeAllValves();
     activeState = AS_LOCKED;
@@ -479,6 +519,7 @@ void tickReturn() {
 
 void runActiveMode() {
   switch (activeState) {
+    case AS_RESET: tickReset(); break;
     case AS_INFLATE: tickInflate(); break;
     case AS_SWEEP: tickSweep(); break;
     case AS_RETURN: tickReturn(); break;
@@ -550,8 +591,8 @@ void startCalibration() {
   lastDotAnimMs = 0;
   dotCount = 1;
   lcdClear();
-  enterInflate(); // 실제 능동형 하드웨어 알고리즘 시작
-  Serial.println(F("캘리브레이션(능동형) 시작"));
+  enterReset(); // 현재 상태와 무관하게 일단 전부 배기하고 시작
+  Serial.println(F("캘리브레이션(능동형) 시작 - 초기화(배기)부터"));
 }
 
 void tickCalibration() {
@@ -598,11 +639,30 @@ Mode2State mode2State = M2_IDLE;
 unsigned long alertStartMs = 0;
 unsigned long lastBlinkMs = 0;
 bool blinkOn = false;
-const unsigned long ALERT_DURATION_MS = 10000;
+const unsigned long ALERT_DURATION_MS = 10000; // 자세 복귀가 계속 안 될 경우의 최대 유지 시간(안전상한)
 const unsigned long BLINK_INTERVAL_MS = 250;
 const unsigned int ALERT_TONE_HZ = 440;
 uint8_t alertBeepCount = 0;
 const uint8_t ALERT_BEEP_MAX = 4;
+
+// 실측 센서 기반 자세 이상 감지: BALANCED 진입 시점의 압력을 기준압으로 저장해두고,
+// 각 포켓이 기준압 대비 postureThreshold 이상 벗어나면 자세가 흐트러진 것으로 판단
+uint16_t postureBaseline[4];
+uint16_t postureThreshold = 60; // raw 편차 임계값 (시리얼 POSTURE,<raw> 로 조정 가능)
+const unsigned long POSTURE_CHECK_INTERVAL_MS = 200;
+unsigned long lastPostureCheckMs = 0;
+const unsigned long ALERT_MIN_MS = 1000; // 짧은 순간 튐으로 바로 복귀 판정되지 않도록 최소 유지 시간
+
+bool postureImbalanced() {
+  readAllSensors();
+  for (uint8_t i = 0; i < 4; i++) {
+    uint16_t dev = sensorRaw[i] > postureBaseline[i]
+                     ? sensorRaw[i] - postureBaseline[i]
+                     : postureBaseline[i] - sensorRaw[i];
+    if (dev > postureThreshold) return true;
+  }
+  return false;
+}
 
 void showWellBalanced() {
   lcdPrintLine(0, "Well balanced :)");
@@ -626,8 +686,11 @@ void enterMode2Balanced() {
   lcdBacklightOn();
   stopAllPumps();
   closeAllValves(); // 진입 시점 경도(밸브 잠금) 상태 유지
+  readAllSensors();
+  for (uint8_t i = 0; i < 4; i++) postureBaseline[i] = sensorRaw[i];
+  lastPostureCheckMs = millis();
   showWellBalanced();
-  Serial.println(F("모드2 진입 - Well balanced"));
+  Serial.println(F("모드2 진입 - Well balanced (기준압 저장)"));
 }
 
 void enterMode2Alert() {
@@ -646,14 +709,18 @@ void tickMode2() {
 
   unsigned long now = millis();
 
-  // ---- 준비: 실제 자세 이상 감지 트리거로 교체할 것 (지금은 임시로 엔코더 CW 회전 감지)
-  noInterrupts();
-  int8_t step = rotAccum;
-  rotAccum = 0;
-  interrupts();
-  if (mode2State == M2_BALANCED && step > 0) {
-    enterMode2Alert();
-    return;
+  if (mode2State == M2_BALANCED) {
+    if (now - lastPostureCheckMs >= POSTURE_CHECK_INTERVAL_MS) {
+      lastPostureCheckMs = now;
+      if (postureImbalanced()) {
+        enterMode2Alert();
+        return;
+      }
+    }
+    // 자세가 안정적일 땐 엔코더를 돌려도 반응하지 않도록 잔여 회전을 흘려버림
+    noInterrupts();
+    rotAccum = 0;
+    interrupts();
   }
 
   if (mode2State == M2_ALERT) {
@@ -671,7 +738,9 @@ void tickMode2() {
         noTone(BUZZER_PIN);
       }
     }
-    if (now - alertStartMs >= ALERT_DURATION_MS) { // ---- 준비 필요: 실측 조건(자세 복귀 판정)으로 교체
+    unsigned long elapsed = now - alertStartMs;
+    bool recovered = elapsed >= ALERT_MIN_MS && !postureImbalanced();
+    if (recovered || elapsed >= ALERT_DURATION_MS) {
       noTone(BUZZER_PIN);
       lcdBacklightOn();
       playCompleteChime();
@@ -685,14 +754,16 @@ enum Mode3State { M3_IDLE, M3_SELECT, M3_ADJUST, M3_PRESET_SELECT, M3_PRESET_SAV
 Mode3State mode3State = M3_IDLE;
 uint8_t selectedPocket = 0; // 0~3 = 포켓 1~4, 4 = 북마크(프리셋 저장)
 uint8_t presetSelectIdx = 0; // 0~2 = 프리셋 1~3
-uint8_t presets[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}; // 프리셋별 저장된 포켓 레벨(1~10), EEPROM과 동기화
+uint8_t presets[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}; // 프리셋별 저장된 포켓 레벨(0~10, 0=완전배기 특수값), EEPROM과 동기화
 const int EEPROM_PRESET_BASE = 0; // 프리셋 3개 * 4바이트 = 12바이트(주소 0~11) 사용
+const int EEPROM_SEED_FLAG_ADDR = EEPROM_PRESET_BASE + 12; // 주소 12: 기본 프리셋 시딩 여부 마커
+const uint8_t EEPROM_SEED_MAGIC = 0xA6; // 값 바뀔 때마다 이 매직바이트를 올려서 재시딩 트리거 (2026-07-28: 0xA5->0xA6)
 
 void loadPresetsFromEeprom() {
   for (uint8_t p = 0; p < 3; p++) {
     for (uint8_t i = 0; i < 4; i++) {
       uint8_t v = EEPROM.read(EEPROM_PRESET_BASE + p * 4 + i);
-      presets[p][i] = (v >= 1 && v <= 10) ? v : 0;
+      presets[p][i] = (v <= 10) ? v : 0;
     }
   }
 }
@@ -703,16 +774,36 @@ void savePresetToEeprom(uint8_t idx) {
   }
 }
 
+// 최초 1회(EEPROM에 시딩 마커가 없을 때)만 기본 프리셋 값을 심어둠 -
+// 이후에는 사용자가 북마크로 저장한 값이 계속 유지되고 다시 덮어쓰지 않음
+void seedDefaultPresetsIfNeeded() {
+  if (EEPROM.read(EEPROM_SEED_FLAG_ADDR) == EEPROM_SEED_MAGIC) return;
+  const uint8_t defaults[3][4] = {{1, 1, 8, 8}, {2, 2, 2, 2}, {8, 8, 8, 8}};
+  for (uint8_t p = 0; p < 3; p++) {
+    for (uint8_t i = 0; i < 4; i++) {
+      presets[p][i] = defaults[p][i];
+    }
+    savePresetToEeprom(p);
+  }
+  EEPROM.update(EEPROM_SEED_FLAG_ADDR, EEPROM_SEED_MAGIC);
+  Serial.println(F("기본 프리셋 시딩 완료: 1=1,1,8,8 / 2=2,2,2,2 / 3=8,8,8,8"));
+}
+
 unsigned long lastBlinkSelMs = 0;
 bool blinkSelOn = true;
 const unsigned long SELECT_BLINK_MS = 500;
 
 // 매뉴얼 조절: "계속 돌리는 동안만" 홀드 방식 (파일럿2와 동일 패턴)
-const unsigned long ADJUST_HOLD_TIMEOUT_MS = 200;
+unsigned long adjustHoldTimeoutMs = 250; // 시리얼 HOLD,<ms> 명령으로 조정 (50~1000 범위로 clamp)
+const unsigned long ADJUST_HOLD_MIN_MS = 50;
+const unsigned long ADJUST_HOLD_MAX_MS = 1000;
 unsigned long lastAdjustCwMs = 0;
 unsigned long lastAdjustCcwMs = 0;
 unsigned long lastAdjustDrawMs = 0;
 const unsigned long ADJUST_DRAW_INTERVAL_MS = 150;
+int8_t pendingAdjustDir = 0;   // 파일럿2와 동일한 "첫 펄스 확인" 패턴 - 단발성 신호는 무시
+unsigned long pendingAdjustMs = 0;
+int8_t lastAdjustAction = 0;   // 0=정지, 1=부풀리기, -1=배기 (직전 상태 - 바뀔 때만 I2C 씀)
 
 void showMode3Default() {
   readAllSensors();
@@ -789,8 +880,10 @@ void enterMode3Select() {
 
 void enterMode3Adjust() {
   mode3State = M3_ADJUST;
-  lastAdjustCwMs = millis() - ADJUST_HOLD_TIMEOUT_MS - 1;
-  lastAdjustCcwMs = millis() - ADJUST_HOLD_TIMEOUT_MS - 1;
+  lastAdjustCwMs = millis() - adjustHoldTimeoutMs - 1;
+  lastAdjustCcwMs = millis() - adjustHoldTimeoutMs - 1;
+  pendingAdjustDir = 0;
+  lastAdjustAction = 0;
   readAllSensors();
   drawAdjustScreen();
 }
@@ -831,30 +924,61 @@ void tickMode3() {
       drawSelectScreen();
     }
   } else if (mode3State == M3_ADJUST) {
-    // "계속 돌리는 동안만" 작동하는 홀드 방식 (파일럿2와 동일 UX)
-    if (step > 0) lastAdjustCwMs = now;
-    else if (step < 0) lastAdjustCcwMs = now;
+    // 파일럿2와 동일한 "첫 펄스 확인" 홀드 방식: 단발성 회전 신호는 바로 반영하지 않고
+    // pending으로만 기록해두고, 유효시간 내에 같은 방향 신호가 한 번 더 들어오거나
+    // 이미 홀드 중이면 그때 실제로 반영한다. 회전량 자체는 그대로 누적되므로 조절 정밀도는
+    // 그대로고, 릴레이/솔레노이드에 순간적으로 튀는 단발 신호만 걸러진다.
+    if (step > 0) {
+      bool alreadyHoldingCw = (now - lastAdjustCwMs) < adjustHoldTimeoutMs;
+      bool pendingConfirmed = pendingAdjustDir == 1 && (now - pendingAdjustMs) < adjustHoldTimeoutMs;
+      if (alreadyHoldingCw || pendingConfirmed) {
+        lastAdjustCwMs = now;
+        pendingAdjustDir = 0;
+      } else {
+        pendingAdjustDir = 1;
+        pendingAdjustMs = now;
+      }
+    } else if (step < 0) {
+      bool alreadyHoldingCcw = (now - lastAdjustCcwMs) < adjustHoldTimeoutMs;
+      bool pendingConfirmed = pendingAdjustDir == -1 && (now - pendingAdjustMs) < adjustHoldTimeoutMs;
+      if (alreadyHoldingCcw || pendingConfirmed) {
+        lastAdjustCcwMs = now;
+        pendingAdjustDir = 0;
+      } else {
+        pendingAdjustDir = -1;
+        pendingAdjustMs = now;
+      }
+    }
+    if (pendingAdjustDir != 0 && (now - pendingAdjustMs) >= adjustHoldTimeoutMs) {
+      pendingAdjustDir = 0; // 시간 내에 확인되지 않은 단발 신호는 폐기
+    }
 
-    bool holdingCw = (now - lastAdjustCwMs) < ADJUST_HOLD_TIMEOUT_MS;
-    bool holdingCcw = (now - lastAdjustCcwMs) < ADJUST_HOLD_TIMEOUT_MS;
+    bool holdingCw = (now - lastAdjustCwMs) < adjustHoldTimeoutMs;
+    bool holdingCcw = (now - lastAdjustCcwMs) < adjustHoldTimeoutMs;
 
     uint8_t groupIdx = POCKET_GROUP[selectedPocket];
     readAllSensors();
 
-    bool shouldInflate = holdingCw && sensorRaw[selectedPocket] < pressureCeilingRaw;
-    bool shouldDeflate = !shouldInflate && holdingCcw && sensorRaw[selectedPocket] > pressureFloorRaw;
+    // 상/하한 경계 근처에서 센서 노이즈(±toleranceRaw)만으로 on/off가 계속 뒤집히는 걸
+    // 막기 위해 여유폭을 둠 (안 그러면 경계에서 릴레이가 초고속으로 딱딱거릴 수 있음)
+    bool shouldInflate = holdingCw && sensorRaw[selectedPocket] < (pressureCeilingRaw - toleranceRaw);
+    bool shouldDeflate = !shouldInflate && holdingCcw && sensorRaw[selectedPocket] > (pressureFloorRaw + toleranceRaw);
 
-    if (shouldInflate) {
-      setValve3way(groupIdx, true);
-      setValve2way(selectedPocket, true);
-      runPump(groupIdx, pumpSpeed);
-    } else if (shouldDeflate) {
-      setValve3way(groupIdx, false);
-      setValve2way(selectedPocket, true);
-      stopPump(groupIdx);
-    } else {
-      setValve2way(selectedPocket, false);
-      stopPump(groupIdx);
+    int8_t desiredAction = shouldInflate ? 1 : (shouldDeflate ? -1 : 0);
+    if (desiredAction != lastAdjustAction) {
+      if (desiredAction == 1) {
+        setValve3way(groupIdx, true);
+        setValve2way(selectedPocket, true);
+        runPump(groupIdx, pumpSpeed);
+      } else if (desiredAction == -1) {
+        setValve3way(groupIdx, false);
+        setValve2way(selectedPocket, true);
+        stopPump(groupIdx);
+      } else {
+        setValve2way(selectedPocket, false);
+        stopPump(groupIdx);
+      }
+      lastAdjustAction = desiredAction;
     }
 
     if (now - lastAdjustDrawMs >= ADJUST_DRAW_INTERVAL_MS) {
@@ -927,6 +1051,13 @@ void enterModeSelect() {
 void confirmModeSelect() {
   currentModeIdx = modeSelectIdx;
   topState = TOP_IN_MODE;
+  if (currentModeIdx == 0) {
+    startCalibration();
+  } else if (currentModeIdx == 1) {
+    enterMode2Balanced();
+  } else if (currentModeIdx == 2) {
+    enterMode3Select();
+  }
 }
 
 void tickModeSelect() {
@@ -978,28 +1109,21 @@ void handleDoubleClick() {
   if (topState == TOP_MODE_SELECT) return;
 
   if (currentModeIdx == 0) {
-    if (calState == CAL_IDLE) {
-      enterModeSelect();
-    } else {
-      calState = CAL_IDLE;
-      stopEverythingSafely();
-      buzzerActive = false;
-      showMode(0);
-    }
+    stopEverythingSafely();
+    buzzerActive = false;
+    enterModeSelect();
   } else if (currentModeIdx == 1) {
-    if (mode2State == M2_IDLE) {
+    enterModeSelect();
+  } else if (currentModeIdx == 2) {
+    if (mode3State == M3_SELECT) {
       enterModeSelect();
     } else {
-      resetMode2();
-      showMode(1);
-    }
-  } else if (currentModeIdx == 2) {
-    if (mode3State == M3_IDLE) {
-      enterModeSelect();
-    } else if (mode3State == M3_SELECT) {
-      resetMode3();
-      showMode3Default();
-    } else if (mode3State == M3_ADJUST || mode3State == M3_PRESET_SELECT || mode3State == M3_PRESET_SAVED) {
+      if (mode3State == M3_ADJUST) {
+        // 홀드 도중(회전 중) 빠져나가도 액추에이터가 방치되지 않도록 명시적으로 정지
+        uint8_t groupIdx = POCKET_GROUP[selectedPocket];
+        stopPump(groupIdx);
+        setValve2way(selectedPocket, false);
+      }
       mode3State = M3_SELECT;
       blinkSelOn = true;
       lastBlinkSelMs = millis();
@@ -1009,6 +1133,7 @@ void handleDoubleClick() {
 }
 
 void tickClickResolution() {
+  if (presetApplying) return; // 프리셋 적용(하드웨어 이동) 중엔 클릭 처리 보류 - 능동형 모드 등과 상태 충돌 방지
   if (clickPending && (millis() - clickPendingMs) > DOUBLE_CLICK_WINDOW_MS) {
     clickPending = false;
     handleSingleClick();
@@ -1046,7 +1171,7 @@ void handlePowerSwitch() {
     encSwPressStartMs = now;
     longPressFired = false;
   } else if (swNow == HIGH && encSwPrevState == LOW) {
-    if (!longPressFired && systemOn) {
+    if (!longPressFired && systemOn && !presetApplying) {
       if (clickPending && (now - clickPendingMs) <= DOUBLE_CLICK_WINDOW_MS) {
         clickPending = false;
         handleDoubleClick();
@@ -1083,6 +1208,7 @@ void activatePreset(uint8_t idx) {
   lcdPrintLine(1, "Applying...");
   presetApplying = true;
   presetApplyingIdx = idx;
+  clickPending = false; // 적용 도중 대기 중이던 클릭이 나중에 엉뚱하게 발동하지 않도록 초기화
   uint16_t targets[4];
   for (uint8_t i = 0; i < 4; i++) targets[i] = levelToRawTarget(presets[idx][i]);
   startTargetSeek(targets);
@@ -1127,6 +1253,31 @@ void handleCommand(const String &line) {
     toleranceRaw = (uint16_t)line.substring(firstComma + 1).toInt();
   } else if (cmd == "SPEED") {
     pumpSpeed = (uint8_t)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "HOLD") {
+    long v = line.substring(firstComma + 1).toInt();
+    if (v < (long)ADJUST_HOLD_MIN_MS) v = ADJUST_HOLD_MIN_MS;
+    if (v > (long)ADJUST_HOLD_MAX_MS) v = ADJUST_HOLD_MAX_MS;
+    adjustHoldTimeoutMs = (unsigned long)v;
+  } else if (cmd == "POSTURE") {
+    postureThreshold = (uint16_t)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "RESETRAW") {
+    resetTargetRaw = (uint16_t)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "DEBUGPRINT") {
+    debugPrintEnabled = line.substring(firstComma + 1).toInt() != 0;
+    Serial.print(F("DEBUGPRINT "));
+    Serial.println(debugPrintEnabled ? F("ON") : F("OFF"));
+  } else if (cmd == "PRESET") {
+    // 택트스위치 미결선 상태에서 프리셋 적용을 시리얼로 대신 트리거 (PRESET,1~3, 사용자 표시번호 기준)
+    int n = line.substring(firstComma + 1).toInt();
+    if (n < 1 || n > 3) {
+      Serial.println(F("PRESET,1~3 범위로 입력할 것"));
+    } else if (!systemOn) {
+      Serial.println(F("시스템이 꺼져있어서 프리셋 적용 불가 (롱프레스로 전원 켤 것)"));
+    } else if (calState == CAL_ANALYZING || presetApplying) {
+      Serial.println(F("지금은 다른 하드웨어 동작 중이라 프리셋 적용 불가"));
+    } else {
+      activatePreset((uint8_t)(n - 1));
+    }
   } else if (cmd == "STATUS") {
     Serial.print(F("CEIL,"));
     Serial.print(pressureCeilingRaw);
@@ -1135,12 +1286,21 @@ void handleCommand(const String &line) {
     Serial.print(F(",TOL,"));
     Serial.print(toleranceRaw);
     Serial.print(F(",SPEED,"));
-    Serial.println(pumpSpeed);
+    Serial.print(pumpSpeed);
+    Serial.print(F(",HOLD,"));
+    Serial.print(adjustHoldTimeoutMs);
+    Serial.print(F(",POSTURE,"));
+    Serial.print(postureThreshold);
+    Serial.print(F(",RESETRAW,"));
+    Serial.print(resetTargetRaw);
+    Serial.print(F(",DEBUGPRINT,"));
+    Serial.println(debugPrintEnabled ? 1 : 0);
   }
 }
 
 // ================= 디버그 시리얼 =================
 void printDebug() {
+  if (!debugPrintEnabled) return;
   if (millis() - lastDebugPrintMs < DEBUG_PRINT_INTERVAL_MS) return;
   lastDebugPrintMs = millis();
   Serial.print(F("TOP,"));
@@ -1168,6 +1328,7 @@ void setup() {
   Serial.begin(115200);
   Wire.begin();
   loadPresetsFromEeprom();
+  seedDefaultPresetsIfNeeded();
 
   pinMode(ENC_CLK_PIN, INPUT_PULLUP);
   pinMode(ENC_DT_PIN, INPUT_PULLUP);
