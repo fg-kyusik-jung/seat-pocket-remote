@@ -83,8 +83,9 @@ int8_t currentModeIdx = 0; // 0=AUTO FIT, 1=REALTIME, 2=MANUAL
 // 프리셋 전역 단축키 상태 (핸들러/함수는 아래쪽에 정의, 변수만 먼저 선언)
 bool presetApplying = false;
 uint8_t presetApplyingIdx = 0;
-unsigned long presetDisplayUntilMs = 0;
-const unsigned long PRESET_DISPLAY_HOLD_MS = 1500;
+uint16_t presetPreviousRaw[4] = {0, 0, 0, 0}; // 프리셋 적용 시작 직전 압력 (중단 시 이 값으로 복귀)
+bool presetReverting = false; // 중단 후 직전 상태로 되돌아가는 중(완료 처리 분기용)
+bool presetFrozen = false;    // 프리셋 적용 완료 후 사용자 입력 있을 때까지 화면 고정
 
 // ---------- 엔코더 회전 ----------
 volatile int8_t rotAccum = 0;
@@ -648,10 +649,15 @@ const uint8_t ALERT_BEEP_MAX = 4;
 // 실측 센서 기반 자세 이상 감지: BALANCED 진입 시점의 압력을 기준압으로 저장해두고,
 // 각 포켓이 기준압 대비 postureThreshold 이상 벗어나면 자세가 흐트러진 것으로 판단
 uint16_t postureBaseline[4];
-uint16_t postureThreshold = 60; // raw 편차 임계값 (시리얼 POSTURE,<raw> 로 조정 가능)
+uint16_t postureThreshold = 40; // raw 편차 임계값 (시리얼 POSTURE,<raw> 로 조정 가능)
 const unsigned long POSTURE_CHECK_INTERVAL_MS = 200;
 unsigned long lastPostureCheckMs = 0;
 const unsigned long ALERT_MIN_MS = 1000; // 짧은 순간 튐으로 바로 복귀 판정되지 않도록 최소 유지 시간
+
+// 자세이상이 순간적인 튐이 아니라 일정 시간 지속될 때만 알림 (2026-07-29: 너무 빨리 울린다는 피드백으로 추가)
+unsigned long postureConfirmMs = 2000; // 시리얼 POSTURECONFIRM,<ms> 로 조정 가능
+bool imbalanceActive = false;
+unsigned long imbalanceSinceMs = 0;
 
 bool postureImbalanced() {
   readAllSensors();
@@ -689,6 +695,7 @@ void enterMode2Balanced() {
   readAllSensors();
   for (uint8_t i = 0; i < 4; i++) postureBaseline[i] = sensorRaw[i];
   lastPostureCheckMs = millis();
+  imbalanceActive = false;
   showWellBalanced();
   Serial.println(F("모드2 진입 - Well balanced (기준압 저장)"));
 }
@@ -713,8 +720,15 @@ void tickMode2() {
     if (now - lastPostureCheckMs >= POSTURE_CHECK_INTERVAL_MS) {
       lastPostureCheckMs = now;
       if (postureImbalanced()) {
-        enterMode2Alert();
-        return;
+        if (!imbalanceActive) {
+          imbalanceActive = true;
+          imbalanceSinceMs = now;
+        } else if (now - imbalanceSinceMs >= postureConfirmMs) {
+          enterMode2Alert();
+          return;
+        }
+      } else {
+        imbalanceActive = false;
       }
     }
     // 자세가 안정적일 땐 엔코더를 돌려도 반응하지 않도록 잔여 회전을 흘려버림
@@ -746,6 +760,176 @@ void tickMode2() {
       playCompleteChime();
       enterMode2Balanced();
     }
+  }
+}
+
+// ================= 모드4(REALTIME-ACTIVE) 실시간 능동보정 프로토타입 =================
+// 기본 감지 로직은 모드2와 동일(postureBaseline/postureThreshold/postureConfirmMs 등 재사용,
+// 모드2와 모드4는 동시에 돌지 않으므로 상태 공유해도 안전함). 모드2와 다른 점은 감지 이후
+// 그냥 알림만 하고 끝나는 게 아니라, 압력이 오른(=하중이 더 실린) 포켓들을 상한까지 채워서
+// 눌러주는 능동 보정 동작까지 수행한다는 것.
+enum Mode4State { M4_IDLE, M4_MONITORING, M4_ALERT, M4_BOOSTING, M4_HOLD, M4_RETURNING };
+Mode4State mode4State = M4_IDLE;
+unsigned long mode4AlertStartMs = 0;
+unsigned long mode4HoldStartMs = 0;
+bool mode4BoostPocket[4] = {false, false, false, false};
+unsigned long mode4AlertShowMs = 2000;  // 알림(점멸/비프) 표시 시간, 시리얼 MODE4ALERT,<ms> 로 조정
+unsigned long mode4HoldMs = 3000;       // 다 채운 뒤 복귀 전 대기시간, 시리얼 MODE4HOLD,<ms> 로 조정
+
+void enterMode4Monitoring() {
+  mode4State = M4_MONITORING;
+  noTone(BUZZER_PIN);
+  lcdBacklightOn();
+  stopAllPumps();
+  closeAllValves();
+  readAllSensors();
+  for (uint8_t i = 0; i < 4; i++) postureBaseline[i] = sensorRaw[i];
+  lastPostureCheckMs = millis();
+  imbalanceActive = false;
+  showWellBalanced();
+  Serial.println(F("모드4 진입 - 실시간 능동보정 대기 (기준압 저장)"));
+}
+
+void enterMode4Alert() {
+  mode4State = M4_ALERT;
+  mode4AlertStartMs = millis();
+  lastBlinkMs = 0;
+  blinkOn = false;
+  alertBeepCount = 0;
+  showSitUpStraight();
+  Serial.println(F("모드4 - 자세이상 감지, 보정 준비"));
+}
+
+void enterMode4Boosting() {
+  mode4State = M4_BOOSTING;
+  readAllSensors();
+  bool any = false;
+  for (uint8_t i = 0; i < 4; i++) {
+    mode4BoostPocket[i] = sensorRaw[i] > postureBaseline[i] &&
+                          (uint16_t)(sensorRaw[i] - postureBaseline[i]) > postureThreshold;
+    if (mode4BoostPocket[i]) any = true;
+  }
+  if (!any) {
+    // 방어: 이론상 여기 오면 최소 하나는 있어야 하지만, 혹시 몰라 대기 상태로 되돌림
+    enterMode4Monitoring();
+    return;
+  }
+  for (uint8_t g = 0; g < 2; g++) {
+    bool groupNeeded = mode4BoostPocket[g * 2] || mode4BoostPocket[g * 2 + 1];
+    setValve3way(g, groupNeeded);
+    if (groupNeeded) runPump(g, pumpSpeed); else stopPump(g);
+  }
+  for (uint8_t i = 0; i < 4; i++) setValve2way(i, mode4BoostPocket[i]);
+  lcdPrintLine(0, "Adjusting...");
+  lcdPrintLine(1, "");
+  Serial.println(F("모드4 - 압력 상승 포켓 채우기 시작"));
+}
+
+void tickMode4Boosting() {
+  readAllSensors();
+  bool allDone = true;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (mode4BoostPocket[i]) {
+      if (sensorRaw[i] >= pressureCeilingRaw) {
+        setValve2way(i, false);
+        mode4BoostPocket[i] = false;
+      } else {
+        allDone = false;
+      }
+    }
+  }
+  for (uint8_t g = 0; g < 2; g++) {
+    bool stillNeeded = mode4BoostPocket[g * 2] || mode4BoostPocket[g * 2 + 1];
+    if (!stillNeeded) {
+      stopPump(g);
+      setValve3way(g, false);
+    }
+  }
+  if (allDone) {
+    stopAllPumps();
+    for (uint8_t g = 0; g < 2; g++) setValve3way(g, false);
+    mode4State = M4_HOLD;
+    mode4HoldStartMs = millis();
+    lcdPrintLine(0, "Holding...");
+    Serial.println(F("모드4 - 채우기 완료, 홀드 시작"));
+  }
+}
+
+void tickMode4Hold() {
+  if (millis() - mode4HoldStartMs >= mode4HoldMs) {
+    mode4State = M4_RETURNING;
+    startTargetSeek(postureBaseline);
+    lcdPrintLine(0, "Returning...");
+    Serial.println(F("모드4 - 이전 압력으로 복귀 시작"));
+  }
+}
+
+void tickMode4Returning() {
+  if (tickTargetSeek()) {
+    stopAllPumps();
+    closeAllValves();
+    playCompleteChime();
+    enterMode4Monitoring(); // 재무장(새 기준압 다시 캡처)
+  }
+}
+
+void resetMode4() {
+  mode4State = M4_IDLE;
+  stopAllPumps();
+  closeAllValves();
+  noTone(BUZZER_PIN);
+  lcdBacklightOn();
+}
+
+void tickMode4() {
+  if (mode4State == M4_IDLE) return;
+
+  unsigned long now = millis();
+
+  if (mode4State == M4_MONITORING) {
+    if (now - lastPostureCheckMs >= POSTURE_CHECK_INTERVAL_MS) {
+      lastPostureCheckMs = now;
+      if (postureImbalanced()) {
+        if (!imbalanceActive) {
+          imbalanceActive = true;
+          imbalanceSinceMs = now;
+        } else if (now - imbalanceSinceMs >= postureConfirmMs) {
+          enterMode4Alert();
+          return;
+        }
+      } else {
+        imbalanceActive = false;
+      }
+    }
+    noInterrupts();
+    rotAccum = 0;
+    interrupts();
+  } else if (mode4State == M4_ALERT) {
+    if (now - lastBlinkMs >= BLINK_INTERVAL_MS) {
+      lastBlinkMs = now;
+      blinkOn = !blinkOn;
+      if (blinkOn) {
+        lcdBacklightOn();
+        if (alertBeepCount < ALERT_BEEP_MAX) {
+          tone(BUZZER_PIN, ALERT_TONE_HZ);
+          alertBeepCount++;
+        }
+      } else {
+        lcdBacklightOff();
+        noTone(BUZZER_PIN);
+      }
+    }
+    if (now - mode4AlertStartMs >= mode4AlertShowMs) {
+      noTone(BUZZER_PIN);
+      lcdBacklightOn();
+      enterMode4Boosting();
+    }
+  } else if (mode4State == M4_BOOSTING) {
+    tickMode4Boosting();
+  } else if (mode4State == M4_HOLD) {
+    tickMode4Hold();
+  } else if (mode4State == M4_RETURNING) {
+    tickMode4Returning();
   }
 }
 
@@ -1009,7 +1193,7 @@ void tickMode3() {
 enum TopState { TOP_MODE_SELECT, TOP_IN_MODE };
 TopState topState = TOP_MODE_SELECT;
 uint8_t modeSelectIdx = 0;
-const char *MODE_NAMES[3] = {"AUTO FIT", "REALTIME", "MANUAL"};
+const char *MODE_NAMES[4] = {"AUTO FIT", "REALTIME", "MANUAL", "RT-ACTIVE"};
 
 void showSystemOn() {
   lcdPrintLine(0, "SYSTEM ON");
@@ -1041,10 +1225,11 @@ void showModeSelectPreview() {
 
 void enterModeSelect() {
   topState = TOP_MODE_SELECT;
-  if (currentModeIdx >= 0 && currentModeIdx <= 2) modeSelectIdx = currentModeIdx;
+  if (currentModeIdx >= 0 && currentModeIdx <= 3) modeSelectIdx = currentModeIdx;
   calState = CAL_IDLE;
   resetMode2();
   resetMode3();
+  resetMode4();
   showModeSelectPreview();
 }
 
@@ -1057,6 +1242,8 @@ void confirmModeSelect() {
     enterMode2Balanced();
   } else if (currentModeIdx == 2) {
     enterMode3Select();
+  } else if (currentModeIdx == 3) {
+    enterMode4Monitoring();
   }
 }
 
@@ -1067,7 +1254,7 @@ void tickModeSelect() {
   interrupts();
 
   bool changed = false;
-  if (step > 0 && modeSelectIdx < 2) {
+  if (step > 0 && modeSelectIdx < 3) {
     modeSelectIdx++;
     changed = true;
   } else if (step < 0 && modeSelectIdx > 0) {
@@ -1088,6 +1275,8 @@ void handleSingleClick() {
     startCalibration();
   } else if (currentModeIdx == 1 && mode2State == M2_IDLE) {
     enterMode2Balanced();
+  } else if (currentModeIdx == 3 && mode4State == M4_IDLE) {
+    enterMode4Monitoring();
   } else if (currentModeIdx == 2) {
     if (mode3State == M3_IDLE) {
       enterMode3Select();
@@ -1129,6 +1318,10 @@ void handleDoubleClick() {
       lastBlinkSelMs = millis();
       drawSelectScreen();
     }
+  } else if (currentModeIdx == 3) {
+    // 어느 하위 상태(BOOSTING/HOLD/RETURNING 포함)에서 빠져나가든 하드웨어를 안전하게 정지
+    stopEverythingSafely();
+    enterModeSelect();
   }
 }
 
@@ -1171,8 +1364,13 @@ void handlePowerSwitch() {
     encSwPressStartMs = now;
     longPressFired = false;
   } else if (swNow == HIGH && encSwPrevState == LOW) {
-    if (!longPressFired && systemOn && !presetApplying) {
-      if (clickPending && (now - clickPendingMs) <= DOUBLE_CLICK_WINDOW_MS) {
+    if (!longPressFired && systemOn) {
+      if (presetApplying) {
+        abortPresetApplying(); // 적용/복귀 도중 클릭하면 그 자리에서 바로 중단
+      } else if (presetFrozen) {
+        presetFrozen = false;
+        enterModeSelect(); // 프리셋 적용 완료 화면에서 클릭하면 모드선택으로
+      } else if (clickPending && (now - clickPendingMs) <= DOUBLE_CLICK_WINDOW_MS) {
         clickPending = false;
         handleDoubleClick();
       } else {
@@ -1198,7 +1396,7 @@ void activatePreset(uint8_t idx) {
 
   if (!anySaved) {
     lcdPrintLine(1, "Empty");
-    presetDisplayUntilMs = millis() + PRESET_DISPLAY_HOLD_MS;
+    presetFrozen = true;
     Serial.print(F("프리셋 "));
     Serial.print(idx + 1);
     Serial.println(F(" 저장된 값 없음"));
@@ -1206,7 +1404,11 @@ void activatePreset(uint8_t idx) {
   }
 
   lcdPrintLine(1, "Applying...");
+  readAllSensors();
+  for (uint8_t i = 0; i < 4; i++) presetPreviousRaw[i] = sensorRaw[i]; // 중단 시 되돌아갈 직전 상태 저장
   presetApplying = true;
+  presetReverting = false;
+  presetFrozen = false;
   presetApplyingIdx = idx;
   clickPending = false; // 적용 도중 대기 중이던 클릭이 나중에 엉뚱하게 발동하지 않도록 초기화
   uint16_t targets[4];
@@ -1223,14 +1425,28 @@ void activatePreset(uint8_t idx) {
   Serial.println();
 }
 
+// 프리셋 적용(또는 복귀) 도중 사용자가 다른 동작(클릭/다른 프리셋)을 시도하면
+// 그 자리에서 즉시 중단하고, 목표를 "이 프리셋 적용 시작 직전 압력"으로 바꿔서
+// 안전하게 되돌린다 - 이래야 4포켓이 어중간하게 섞인 상태로 방치되지 않는다.
+void abortPresetApplying() {
+  if (!presetApplying) return;
+  presetReverting = true;
+  startTargetSeek(presetPreviousRaw);
+  lcdPrintLine(0, "Canceled");
+  lcdPrintLine(1, "Reverting...");
+  Serial.println(F("프리셋 적용 중단 - 직전 압력으로 복귀 시작"));
+}
+
 void handlePresetSwitches() {
   if (millis() - lastSwPollMs < SW_DEBOUNCE_MS) return;
   lastSwPollMs = millis();
   for (uint8_t i = 0; i < 3; i++) {
     bool pressed = readSwitch(i);
     if (pressed && !swWasPressed[i]) {
-      if (calState == CAL_ANALYZING || presetApplying) {
+      if (calState == CAL_ANALYZING) {
         Serial.println(F("지금은 다른 하드웨어 동작 중이라 프리셋 적용 불가"));
+      } else if (presetApplying) {
+        abortPresetApplying();
       } else {
         activatePreset(i);
       }
@@ -1262,6 +1478,12 @@ void handleCommand(const String &line) {
     postureThreshold = (uint16_t)line.substring(firstComma + 1).toInt();
   } else if (cmd == "RESETRAW") {
     resetTargetRaw = (uint16_t)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "POSTURECONFIRM") {
+    postureConfirmMs = (unsigned long)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "MODE4ALERT") {
+    mode4AlertShowMs = (unsigned long)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "MODE4HOLD") {
+    mode4HoldMs = (unsigned long)line.substring(firstComma + 1).toInt();
   } else if (cmd == "DEBUGPRINT") {
     debugPrintEnabled = line.substring(firstComma + 1).toInt() != 0;
     Serial.print(F("DEBUGPRINT "));
@@ -1293,6 +1515,12 @@ void handleCommand(const String &line) {
     Serial.print(postureThreshold);
     Serial.print(F(",RESETRAW,"));
     Serial.print(resetTargetRaw);
+    Serial.print(F(",POSTURECONFIRM,"));
+    Serial.print(postureConfirmMs);
+    Serial.print(F(",MODE4ALERT,"));
+    Serial.print(mode4AlertShowMs);
+    Serial.print(F(",MODE4HOLD,"));
+    Serial.print(mode4HoldMs);
     Serial.print(F(",DEBUGPRINT,"));
     Serial.println(debugPrintEnabled ? 1 : 0);
   }
@@ -1315,6 +1543,8 @@ void printDebug() {
   Serial.print((int)mode2State);
   Serial.print(F(",M3,"));
   Serial.print((int)mode3State);
+  Serial.print(F(",M4,"));
+  Serial.print((int)mode4State);
   Serial.print(F(",RAW,"));
   for (uint8_t i = 0; i < 4; i++) {
     Serial.print(sensorRaw[i]);
@@ -1372,6 +1602,7 @@ void loop() {
   tickClickResolution();
 
   if (systemOn) {
+    readAllSensors(); // 어떤 화면/모드에 있든 sensorRaw는 항상 최신 상태로 유지 (디버그 RAW 출력이 특정 모드에서만 갱신되던 문제 수정)
     handlePresetSwitches();
 
     if (presetApplying) {
@@ -1379,22 +1610,29 @@ void loop() {
         presetApplying = false;
         stopAllPumps();
         closeAllValves();
-        char line1[17];
-        snprintf(line1, sizeof(line1), "%d %d %d %d",
-                 presets[presetApplyingIdx][0], presets[presetApplyingIdx][1],
-                 presets[presetApplyingIdx][2], presets[presetApplyingIdx][3]);
-        lcdPrintLine(1, line1);
-        presetDisplayUntilMs = millis() + PRESET_DISPLAY_HOLD_MS;
-        Serial.println(F("프리셋 적용 완료"));
+        if (presetReverting) {
+          presetReverting = false;
+          Serial.println(F("직전 압력으로 복귀 완료"));
+          enterModeSelect();
+        } else {
+          char line1[17];
+          snprintf(line1, sizeof(line1), "%d %d %d %d",
+                   presets[presetApplyingIdx][0], presets[presetApplyingIdx][1],
+                   presets[presetApplyingIdx][2], presets[presetApplyingIdx][3]);
+          lcdPrintLine(1, line1);
+          presetFrozen = true;
+          Serial.println(F("프리셋 적용 완료 - 클릭할 때까지 화면 고정"));
+        }
       }
-    } else if (millis() < presetDisplayUntilMs) {
-      // 프리셋 화면 유지 중 - 다른 화면 갱신 보류
+    } else if (presetFrozen) {
+      // 사용자가 클릭(모드선택으로 이동)하거나 다른 프리셋을 누를 때까지 이 화면 그대로 유지
     } else if (topState == TOP_MODE_SELECT) {
       tickModeSelect();
     } else {
       tickCalibration();
       tickMode2();
       tickMode3();
+      tickMode4();
     }
 
     printDebug();
