@@ -933,6 +933,196 @@ void tickMode4() {
   }
 }
 
+// ================= 모드5(STRETCHING) 대각선 포켓 교대 스트레칭 =================
+// 순서: (전부 배기) -> 포켓0+3 채우고 3초 유지 후 배기 -> 포켓1+2 채우고 3초 유지 후 배기
+// 이 한 세트를 stretchReps(기본 10)번 반복 -> 시작 전 압력으로 복귀 + 완료 알림
+enum Mode5Sub { M5_IDLE, M5_RESET, M5_INFLATE, M5_HOLD, M5_DEFLATE, M5_RETURNING, M5_DONE };
+Mode5Sub mode5Sub = M5_IDLE;
+unsigned long mode5PhaseStartMs = 0;
+uint16_t mode5PreviousRaw[4] = {0, 0, 0, 0}; // 스트레칭 시작 전 압력(끝나면 이 값으로 복귀)
+bool stretchPhaseA = true;                   // true=포켓0,3 진행 중, false=포켓1,2 진행 중
+uint8_t stretchRepCount = 0;                 // 완료된 세트 수(A+B 한 번 = 1세트)
+uint8_t stretchReps = 10;                    // 시리얼 STRETCHREPS,<n> 로 조정
+unsigned long stretchHoldMs = 3000;          // 시리얼 STRETCHHOLD,<ms> 로 조정
+bool stretchDone[4] = {false, false, false, false};
+
+bool stretchPocketActive(uint8_t i) {
+  return stretchPhaseA ? (i == 0 || i == 3) : (i == 1 || i == 2);
+}
+
+void drawMode5Screen(const char *phaseLabel) {
+  char line0[17];
+  snprintf(line0, sizeof(line0), "Stretch %d/%d", stretchRepCount + 1, stretchReps);
+  lcdPrintLine(0, line0);
+  char line1[17];
+  snprintf(line1, sizeof(line1), "%s P%d+P%d", phaseLabel, stretchPhaseA ? 1 : 2, stretchPhaseA ? 4 : 3);
+  lcdPrintLine(1, line1);
+}
+
+void enterMode5Reset() {
+  mode5Sub = M5_RESET;
+  mode5PhaseStartMs = millis();
+  stopAllPumps();
+  setValve3way(0, false);
+  setValve3way(1, false);
+  for (uint8_t i = 0; i < 4; i++) setValve2way(i, true);
+  lcdPrintLine(0, "Stretching");
+  lcdPrintLine(1, "Preparing...");
+  Serial.println(F("모드5 - 초기화(전체 배기) 시작"));
+}
+
+void tickMode5Reset() {
+  readAllSensors();
+  bool allVented = true;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (sensorRaw[i] > resetTargetRaw) allVented = false;
+  }
+  bool timedOut = (millis() - mode5PhaseStartMs) > RESET_TIMEOUT_MS;
+  if (allVented || timedOut) {
+    for (uint8_t i = 0; i < 4; i++) setValve2way(i, false);
+    stretchPhaseA = true;
+    stretchRepCount = 0;
+    enterMode5Inflate();
+  }
+}
+
+void enterMode5Inflate() {
+  mode5Sub = M5_INFLATE;
+  mode5PhaseStartMs = millis();
+  for (uint8_t i = 0; i < 4; i++) {
+    bool active = stretchPocketActive(i);
+    stretchDone[i] = !active; // 이번 페이즈에 관여 안 하는 포켓은 이미 완료 취급
+    setValve2way(i, active);
+  }
+  for (uint8_t g = 0; g < 2; g++) {
+    bool groupNeeded = stretchPocketActive(g * 2) || stretchPocketActive(g * 2 + 1);
+    setValve3way(g, groupNeeded);
+    if (groupNeeded) runPump(g, pumpSpeed); else stopPump(g);
+  }
+  drawMode5Screen("Fill");
+  Serial.println(F("모드5 - 포켓 채우기 시작"));
+}
+
+void tickMode5Inflate() {
+  readAllSensors();
+  bool allDone = true;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (!stretchDone[i]) {
+      if (sensorRaw[i] >= pressureCeilingRaw) {
+        setValve2way(i, false);
+        stretchDone[i] = true;
+      } else {
+        allDone = false;
+      }
+    }
+  }
+  for (uint8_t g = 0; g < 2; g++) {
+    bool stillNeeded = (!stretchDone[g * 2]) || (!stretchDone[g * 2 + 1]);
+    if (!stillNeeded) {
+      stopPump(g);
+      setValve3way(g, false);
+    }
+  }
+  if (allDone) {
+    stopAllPumps();
+    for (uint8_t g = 0; g < 2; g++) setValve3way(g, false);
+    mode5Sub = M5_HOLD;
+    mode5PhaseStartMs = millis();
+    drawMode5Screen("Hold");
+    Serial.println(F("모드5 - 홀드 시작"));
+  }
+}
+
+void tickMode5Hold() {
+  if (millis() - mode5PhaseStartMs >= stretchHoldMs) {
+    mode5Sub = M5_DEFLATE;
+    mode5PhaseStartMs = millis();
+    for (uint8_t i = 0; i < 4; i++) {
+      bool active = stretchPocketActive(i);
+      stretchDone[i] = !active;
+      if (active) setValve2way(i, true); // 배기(대기모드에서 열기)
+    }
+    drawMode5Screen("Vent");
+    Serial.println(F("모드5 - 배기 시작"));
+  }
+}
+
+void tickMode5Deflate() {
+  readAllSensors();
+  bool allDone = true;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (!stretchDone[i]) {
+      if (sensorRaw[i] <= resetTargetRaw) {
+        setValve2way(i, false);
+        stretchDone[i] = true;
+      } else {
+        allDone = false;
+      }
+    }
+  }
+  bool timedOut = (millis() - mode5PhaseStartMs) > RESET_TIMEOUT_MS;
+  if (allDone || timedOut) {
+    for (uint8_t i = 0; i < 4; i++) setValve2way(i, false);
+    if (stretchPhaseA) {
+      stretchPhaseA = false;
+      enterMode5Inflate();
+    } else {
+      stretchPhaseA = true;
+      stretchRepCount++;
+      if (stretchRepCount >= stretchReps) {
+        mode5Sub = M5_RETURNING;
+        startTargetSeek(mode5PreviousRaw);
+        lcdPrintLine(0, "Stretch Done");
+        lcdPrintLine(1, "Returning...");
+        Serial.println(F("모드5 - 스트레칭 반복 완료, 이전 압력으로 복귀 시작"));
+      } else {
+        enterMode5Inflate();
+      }
+    }
+  }
+}
+
+void tickMode5Returning() {
+  if (tickTargetSeek()) {
+    stopAllPumps();
+    closeAllValves();
+    playCompleteChime();
+    mode5Sub = M5_DONE;
+    lcdPrintLine(0, "Stretching");
+    lcdPrintLine(1, "Complete! :)");
+    Serial.println(F("모드5 - 완료"));
+  }
+}
+
+void enterMode5() {
+  mode5Sub = M5_IDLE;
+  readAllSensors();
+  for (uint8_t i = 0; i < 4; i++) mode5PreviousRaw[i] = sensorRaw[i];
+  enterMode5Reset();
+}
+
+void resetMode5() {
+  mode5Sub = M5_IDLE;
+  stopAllPumps();
+  closeAllValves();
+}
+
+void tickMode5() {
+  if (mode5Sub == M5_IDLE || mode5Sub == M5_DONE) return;
+
+  if (mode5Sub == M5_RESET) {
+    tickMode5Reset();
+  } else if (mode5Sub == M5_INFLATE) {
+    tickMode5Inflate();
+  } else if (mode5Sub == M5_HOLD) {
+    tickMode5Hold();
+  } else if (mode5Sub == M5_DEFLATE) {
+    tickMode5Deflate();
+  } else if (mode5Sub == M5_RETURNING) {
+    tickMode5Returning();
+  }
+}
+
 // ================= 모드3(MANUAL) 포켓 선택/조절 + 프리셋 =================
 enum Mode3State { M3_IDLE, M3_SELECT, M3_ADJUST, M3_PRESET_SELECT, M3_PRESET_SAVED };
 Mode3State mode3State = M3_IDLE;
@@ -1193,7 +1383,7 @@ void tickMode3() {
 enum TopState { TOP_MODE_SELECT, TOP_IN_MODE };
 TopState topState = TOP_MODE_SELECT;
 uint8_t modeSelectIdx = 0;
-const char *MODE_NAMES[4] = {"AUTO FIT", "REALTIME", "MANUAL", "RT-ACTIVE"};
+const char *MODE_NAMES[5] = {"AUTO FIT", "REALTIME", "MANUAL", "RT-ACTIVE", "STRETCHING"};
 
 void showSystemOn() {
   lcdPrintLine(0, "SYSTEM ON");
@@ -1225,11 +1415,12 @@ void showModeSelectPreview() {
 
 void enterModeSelect() {
   topState = TOP_MODE_SELECT;
-  if (currentModeIdx >= 0 && currentModeIdx <= 3) modeSelectIdx = currentModeIdx;
+  if (currentModeIdx >= 0 && currentModeIdx <= 4) modeSelectIdx = currentModeIdx;
   calState = CAL_IDLE;
   resetMode2();
   resetMode3();
   resetMode4();
+  resetMode5();
   showModeSelectPreview();
 }
 
@@ -1244,6 +1435,8 @@ void confirmModeSelect() {
     enterMode3Select();
   } else if (currentModeIdx == 3) {
     enterMode4Monitoring();
+  } else if (currentModeIdx == 4) {
+    enterMode5();
   }
 }
 
@@ -1254,7 +1447,7 @@ void tickModeSelect() {
   interrupts();
 
   bool changed = false;
-  if (step > 0 && modeSelectIdx < 3) {
+  if (step > 0 && modeSelectIdx < 4) {
     modeSelectIdx++;
     changed = true;
   } else if (step < 0 && modeSelectIdx > 0) {
@@ -1277,6 +1470,8 @@ void handleSingleClick() {
     enterMode2Balanced();
   } else if (currentModeIdx == 3 && mode4State == M4_IDLE) {
     enterMode4Monitoring();
+  } else if (currentModeIdx == 4 && mode5Sub == M5_IDLE) {
+    enterMode5();
   } else if (currentModeIdx == 2) {
     if (mode3State == M3_IDLE) {
       enterMode3Select();
@@ -1320,6 +1515,10 @@ void handleDoubleClick() {
     }
   } else if (currentModeIdx == 3) {
     // 어느 하위 상태(BOOSTING/HOLD/RETURNING 포함)에서 빠져나가든 하드웨어를 안전하게 정지
+    stopEverythingSafely();
+    enterModeSelect();
+  } else if (currentModeIdx == 4) {
+    // 어느 하위 단계(채우기/홀드/배기/복귀 포함)에서 빠져나가든 하드웨어를 안전하게 정지
     stopEverythingSafely();
     enterModeSelect();
   }
@@ -1484,6 +1683,10 @@ void handleCommand(const String &line) {
     mode4AlertShowMs = (unsigned long)line.substring(firstComma + 1).toInt();
   } else if (cmd == "MODE4HOLD") {
     mode4HoldMs = (unsigned long)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "STRETCHREPS") {
+    stretchReps = (uint8_t)line.substring(firstComma + 1).toInt();
+  } else if (cmd == "STRETCHHOLD") {
+    stretchHoldMs = (unsigned long)line.substring(firstComma + 1).toInt();
   } else if (cmd == "DEBUGPRINT") {
     debugPrintEnabled = line.substring(firstComma + 1).toInt() != 0;
     Serial.print(F("DEBUGPRINT "));
@@ -1521,6 +1724,10 @@ void handleCommand(const String &line) {
     Serial.print(mode4AlertShowMs);
     Serial.print(F(",MODE4HOLD,"));
     Serial.print(mode4HoldMs);
+    Serial.print(F(",STRETCHREPS,"));
+    Serial.print(stretchReps);
+    Serial.print(F(",STRETCHHOLD,"));
+    Serial.print(stretchHoldMs);
     Serial.print(F(",DEBUGPRINT,"));
     Serial.println(debugPrintEnabled ? 1 : 0);
   }
@@ -1545,6 +1752,8 @@ void printDebug() {
   Serial.print((int)mode3State);
   Serial.print(F(",M4,"));
   Serial.print((int)mode4State);
+  Serial.print(F(",M5,"));
+  Serial.print((int)mode5Sub);
   Serial.print(F(",RAW,"));
   for (uint8_t i = 0; i < 4; i++) {
     Serial.print(sensorRaw[i]);
@@ -1633,6 +1842,7 @@ void loop() {
       tickMode2();
       tickMode3();
       tickMode4();
+      tickMode5();
     }
 
     printDebug();
