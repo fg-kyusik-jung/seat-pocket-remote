@@ -6,5 +6,6 @@
 __pycache__/
 *.pyc
 
-# 실험 로그 데이터
+# 실험 로그 데이터 / 실사용 착석 기록(개인 데이터라 추적 제외)
 server/logs/
+tools/logs/

@@ -87,17 +87,79 @@ uint16_t presetPreviousRaw[4] = {0, 0, 0, 0}; // 프리셋 적용 시작 직전 
 bool presetReverting = false; // 중단 후 직전 상태로 되돌아가는 중(완료 처리 분기용)
 bool presetFrozen = false;    // 프리셋 적용 완료 후 사용자 입력 있을 때까지 화면 고정
 
-// ---------- 엔코더 회전 ----------
+// ---------- 엔코더 회전 (풀 쿼드러처 상태기계 디코드) ----------
+// 기존엔 CLK 하강엣지 1곳만 보고 그 순간 DT값으로 방향을 판정 + 시간 디바운스로
+// 걸렀는데, 새 엔코더 모듈에서 "천천히 한 칸씩 돌릴 때는 정확하지만 보통 속도로
+// 돌리면 +1/-1이 번갈아 찍히며 서로 상쇄돼 아예 안 움직이는" 현상이 실측으로
+// 확인됨(그레이코드 전이 중 순간적인 바운스/노이즈가 방향 반전처럼 잘못 읽힘).
+// CLK+DT 두 핀 전이를 전부 추적하는 상태기계로 바꾸면, 바운스로 인한 왕복 전이는
+// +1/-1이 누적기 안에서 서로 상쇄되고 진짜 한 칸(그레이코드 4상태 전부)이 완주됐을
+// 때만 스텝 하나가 나가서 훨씬 강건함 - 시간 기반 디바운스 자체가 불필요해짐.
 volatile int8_t rotAccum = 0;
-volatile unsigned long lastEncIsrMicros = 0;
-const unsigned long ENC_ISR_DEBOUNCE_US = 5000;
+volatile uint8_t encRawState = 0;   // 직전 (CLK<<1 | DT) 2비트 상태
+volatile int8_t encQuarterAccum = 0; // 한 클릭(그레이코드 4상태)을 채울 때까지의 누적
+
+// idx = (이전상태<<2 | 현재상태), 값은 그 전이가 CW(+1)/CCW(-1)/무효또는무변화(0)인지
+const int8_t ENC_QUAD_TABLE[16] = {
+   0,  1, -1,  0,
+  -1,  0,  0,  1,
+   1,  0,  0, -1,
+   0, -1,  1,  0,
+};
+
+bool encDebugEnabled = false; // 시리얼 ENCDEBUG,1 로 켜기 - 실제 반영된 스텝(클릭)만 기록
+const uint8_t ENC_LOG_SIZE = 32;
+volatile unsigned long encLogUs[ENC_LOG_SIZE];
+volatile int8_t encLogDir[ENC_LOG_SIZE];
+volatile uint8_t encLogHead = 0;
+volatile uint8_t encLogCount = 0;
+
+void logEncStep(unsigned long now, int8_t dir) {
+  encLogUs[encLogHead] = now;
+  encLogDir[encLogHead] = dir;
+  encLogHead = (encLogHead + 1) % ENC_LOG_SIZE;
+  if (encLogCount < ENC_LOG_SIZE) encLogCount++;
+}
 
 void encoderISR() {
-  unsigned long now = micros();
-  if (now - lastEncIsrMicros < ENC_ISR_DEBOUNCE_US) return;
-  lastEncIsrMicros = now;
-  if (digitalRead(ENC_DT_PIN)) rotAccum--;
-  else rotAccum++;
+  uint8_t clk = digitalRead(ENC_CLK_PIN);
+  uint8_t dt = digitalRead(ENC_DT_PIN);
+  uint8_t state = (clk << 1) | dt;
+  uint8_t idx = (encRawState << 2) | state;
+  encRawState = state;
+  encQuarterAccum += ENC_QUAD_TABLE[idx & 0x0F];
+
+  if (encQuarterAccum >= 4) {
+    rotAccum++;
+    encQuarterAccum = 0;
+    if (encDebugEnabled) logEncStep(micros(), 1);
+  } else if (encQuarterAccum <= -4) {
+    rotAccum--;
+    encQuarterAccum = 0;
+    if (encDebugEnabled) logEncStep(micros(), -1);
+  }
+}
+
+void tickEncDebug() {
+  if (!encDebugEnabled || encLogCount == 0) return;
+  noInterrupts();
+  uint8_t count = encLogCount;
+  uint8_t head = encLogHead;
+  encLogCount = 0;
+  interrupts();
+
+  static unsigned long prevUs = 0;
+  uint8_t start = (head + ENC_LOG_SIZE - count) % ENC_LOG_SIZE;
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t idx = (start + i) % ENC_LOG_SIZE;
+    unsigned long us = encLogUs[idx];
+    long deltaUs = (prevUs == 0) ? 0 : (long)(us - prevUs);
+    Serial.print(F("ENC,delta_us="));
+    Serial.print(deltaUs);
+    Serial.print(F(",dir="));
+    Serial.println(encLogDir[idx]);
+    prevUs = us;
+  }
 }
 
 // ---------- IO/밸브 익스팬더 섀도 레지스터 ----------
@@ -1281,16 +1343,19 @@ void tickMode3() {
   interrupts();
 
   if (mode3State == M3_SELECT) {
-    if (step > 0 && selectedPocket < 4) {
-      selectedPocket++;
-      blinkSelOn = true;
-      lastBlinkSelMs = now;
-      drawSelectScreen();
-    } else if (step < 0 && selectedPocket > 0) {
-      selectedPocket--;
-      blinkSelOn = true;
-      lastBlinkSelMs = now;
-      drawSelectScreen();
+    // step의 부호만 보고 항상 1칸만 움직이면, LCD 갱신 등으로 루프가 잠깐 지연되는 동안
+    // 같은 방향 펄스가 여러 개 쌓였을 때 그 중 일부가 씹힌 것처럼 사라짐 - 누적된
+    // 만큼(step 크기 그대로) 반영하고 범위 안으로 클램프
+    if (step != 0) {
+      int newSel = (int)selectedPocket + step;
+      if (newSel < 0) newSel = 0;
+      if (newSel > 4) newSel = 4;
+      if (newSel != (int)selectedPocket) {
+        selectedPocket = (uint8_t)newSel;
+        blinkSelOn = true;
+        lastBlinkSelMs = now;
+        drawSelectScreen();
+      }
     }
     if (now - lastBlinkSelMs >= SELECT_BLINK_MS) {
       lastBlinkSelMs = now;
@@ -1360,16 +1425,16 @@ void tickMode3() {
       drawAdjustScreen();
     }
   } else if (mode3State == M3_PRESET_SELECT) {
-    if (step > 0 && presetSelectIdx < 2) {
-      presetSelectIdx++;
-      blinkSelOn = true;
-      lastBlinkSelMs = now;
-      drawPresetSelectScreen();
-    } else if (step < 0 && presetSelectIdx > 0) {
-      presetSelectIdx--;
-      blinkSelOn = true;
-      lastBlinkSelMs = now;
-      drawPresetSelectScreen();
+    if (step != 0) {
+      int newSel = (int)presetSelectIdx + step;
+      if (newSel < 0) newSel = 0;
+      if (newSel > 2) newSel = 2;
+      if (newSel != (int)presetSelectIdx) {
+        presetSelectIdx = (uint8_t)newSel;
+        blinkSelOn = true;
+        lastBlinkSelMs = now;
+        drawPresetSelectScreen();
+      }
     }
     if (now - lastBlinkSelMs >= SELECT_BLINK_MS) {
       lastBlinkSelMs = now;
@@ -1447,12 +1512,14 @@ void tickModeSelect() {
   interrupts();
 
   bool changed = false;
-  if (step > 0 && modeSelectIdx < 4) {
-    modeSelectIdx++;
-    changed = true;
-  } else if (step < 0 && modeSelectIdx > 0) {
-    modeSelectIdx--;
-    changed = true;
+  if (step != 0) {
+    int newIdx = (int)modeSelectIdx + step;
+    if (newIdx < 0) newIdx = 0;
+    if (newIdx > 4) newIdx = 4;
+    if (newIdx != (int)modeSelectIdx) {
+      modeSelectIdx = (uint8_t)newIdx;
+      changed = true;
+    }
   }
 
   if (changed) showModeSelectPreview();
@@ -1691,6 +1758,10 @@ void handleCommand(const String &line) {
     debugPrintEnabled = line.substring(firstComma + 1).toInt() != 0;
     Serial.print(F("DEBUGPRINT "));
     Serial.println(debugPrintEnabled ? F("ON") : F("OFF"));
+  } else if (cmd == "ENCDEBUG") {
+    encDebugEnabled = line.substring(firstComma + 1).toInt() != 0;
+    Serial.print(F("ENCDEBUG "));
+    Serial.println(encDebugEnabled ? F("ON") : F("OFF"));
   } else if (cmd == "PRESET") {
     // 택트스위치 미결선 상태에서 프리셋 적용을 시리얼로 대신 트리거 (PRESET,1~3, 사용자 표시번호 기준)
     int n = line.substring(firstComma + 1).toInt();
@@ -1729,7 +1800,9 @@ void handleCommand(const String &line) {
     Serial.print(F(",STRETCHHOLD,"));
     Serial.print(stretchHoldMs);
     Serial.print(F(",DEBUGPRINT,"));
-    Serial.println(debugPrintEnabled ? 1 : 0);
+    Serial.print(debugPrintEnabled ? 1 : 0);
+    Serial.print(F(",ENCDEBUG,"));
+    Serial.println(encDebugEnabled ? 1 : 0);
   }
 }
 
@@ -1772,7 +1845,9 @@ void setup() {
   pinMode(ENC_CLK_PIN, INPUT_PULLUP);
   pinMode(ENC_DT_PIN, INPUT_PULLUP);
   pinMode(ENC_SW_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, FALLING);
+  encRawState = (digitalRead(ENC_CLK_PIN) << 1) | digitalRead(ENC_DT_PIN);
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderISR, CHANGE);
 
   pinMode(MOTOR1_IN1_PIN, OUTPUT);
   pinMode(MOTOR1_IN2_PIN, OUTPUT);
@@ -1807,6 +1882,7 @@ void loop() {
     }
   }
 
+  tickEncDebug();
   handlePowerSwitch();
   tickClickResolution();
 
