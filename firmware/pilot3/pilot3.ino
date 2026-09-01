@@ -138,6 +138,13 @@ void encoderISR() {
     encQuarterAccum = 0;
     if (encDebugEnabled) logEncStep(micros(), -1);
   }
+
+  // 정지(디텐트) 위치 = 양쪽 핀 다 HIGH(풀업, 회전 안 하는 중). 여기로 돌아올 때마다
+  // 누적값을 강제로 0에 맞춰서, 중간에 노이즈로 살짝 어긋난 잔여값이 다음 클릭까지
+  // 이어져 "몇 번은 반응 없다가 몰아서 반영되는" 현상을 방지 (2026-08-05)
+  if (state == 3) {
+    encQuarterAccum = 0;
+  }
 }
 
 void tickEncDebug() {
@@ -930,8 +937,7 @@ void tickMode4Returning() {
   if (tickTargetSeek()) {
     stopAllPumps();
     closeAllValves();
-    playCompleteChime();
-    enterMode4Monitoring(); // 재무장(새 기준압 다시 캡처)
+    enterMode4Monitoring(); // 재무장(새 기준압 다시 캡처) - 청각 알림 없이 조용히 재시작
   }
 }
 
@@ -967,22 +973,18 @@ void tickMode4() {
     rotAccum = 0;
     interrupts();
   } else if (mode4State == M4_ALERT) {
+    // 리얼타임 액티브는 압력으로 직접 교정해주는 모드라 청각 알림은 불필요 -
+    // LCD 점멸은 그대로 두고 부저(비프)만 뺌(2026-08-05)
     if (now - lastBlinkMs >= BLINK_INTERVAL_MS) {
       lastBlinkMs = now;
       blinkOn = !blinkOn;
       if (blinkOn) {
         lcdBacklightOn();
-        if (alertBeepCount < ALERT_BEEP_MAX) {
-          tone(BUZZER_PIN, ALERT_TONE_HZ);
-          alertBeepCount++;
-        }
       } else {
         lcdBacklightOff();
-        noTone(BUZZER_PIN);
       }
     }
     if (now - mode4AlertStartMs >= mode4AlertShowMs) {
-      noTone(BUZZER_PIN);
       lcdBacklightOn();
       enterMode4Boosting();
     }
@@ -1243,7 +1245,7 @@ int8_t lastAdjustAction = 0;   // 0=정지, 1=부풀리기, -1=배기 (직전 �
 
 void showMode3Default() {
   readAllSensors();
-  lcdPrintLine(0, "MODE 3 - MANUAL");
+  lcdPrintLine(0, "MODE 2 - MANUAL");
   char line1[17];
   snprintf(line1, sizeof(line1), "%d %d %d %d",
            rawToLevel(sensorRaw[0]), rawToLevel(sensorRaw[1]),
@@ -1448,7 +1450,7 @@ void tickMode3() {
 enum TopState { TOP_MODE_SELECT, TOP_IN_MODE };
 TopState topState = TOP_MODE_SELECT;
 uint8_t modeSelectIdx = 0;
-const char *MODE_NAMES[5] = {"AUTO FIT", "REALTIME", "MANUAL", "RT-ACTIVE", "STRETCHING"};
+const char *MODE_NAMES[5] = {"AUTO FIT", "MANUAL", "REALTIME", "RT-ACTIVE", "STRETCHING"};
 
 void showSystemOn() {
   lcdPrintLine(0, "SYSTEM ON");
@@ -1471,7 +1473,7 @@ void showSystemOff() {
 }
 
 void showModeSelectPreview() {
-  if (modeSelectIdx == 2) {
+  if (modeSelectIdx == 1) {
     showMode3Default();
   } else {
     showMode(modeSelectIdx);
@@ -1495,9 +1497,9 @@ void confirmModeSelect() {
   if (currentModeIdx == 0) {
     startCalibration();
   } else if (currentModeIdx == 1) {
-    enterMode2Balanced();
-  } else if (currentModeIdx == 2) {
     enterMode3Select();
+  } else if (currentModeIdx == 2) {
+    enterMode2Balanced();
   } else if (currentModeIdx == 3) {
     enterMode4Monitoring();
   } else if (currentModeIdx == 4) {
@@ -1533,13 +1535,13 @@ void handleSingleClick() {
   }
   if (currentModeIdx == 0 && calState == CAL_IDLE) {
     startCalibration();
-  } else if (currentModeIdx == 1 && mode2State == M2_IDLE) {
+  } else if (currentModeIdx == 2 && mode2State == M2_IDLE) {
     enterMode2Balanced();
   } else if (currentModeIdx == 3 && mode4State == M4_IDLE) {
     enterMode4Monitoring();
   } else if (currentModeIdx == 4 && mode5Sub == M5_IDLE) {
     enterMode5();
-  } else if (currentModeIdx == 2) {
+  } else if (currentModeIdx == 1) {
     if (mode3State == M3_IDLE) {
       enterMode3Select();
     } else if (mode3State == M3_SELECT) {
@@ -1564,8 +1566,6 @@ void handleDoubleClick() {
     buzzerActive = false;
     enterModeSelect();
   } else if (currentModeIdx == 1) {
-    enterModeSelect();
-  } else if (currentModeIdx == 2) {
     if (mode3State == M3_SELECT) {
       enterModeSelect();
     } else {
@@ -1580,6 +1580,8 @@ void handleDoubleClick() {
       lastBlinkSelMs = millis();
       drawSelectScreen();
     }
+  } else if (currentModeIdx == 2) {
+    enterModeSelect();
   } else if (currentModeIdx == 3) {
     // 어느 하위 상태(BOOSTING/HOLD/RETURNING 포함)에서 빠져나가든 하드웨어를 안전하게 정지
     stopEverythingSafely();
